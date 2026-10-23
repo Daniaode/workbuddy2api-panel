@@ -625,10 +625,22 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	}
 	checkinMsg := ""
 	checkinDone := false
+	// respUnsupported 标记「该 realm 本来就没有签到体系」——前端据此显示中性的
+	// 「无此功能」，而不是把它当成一次失败或一次成功。
+	respUnsupported := false
 	// 企业版无签到体系（上游 400 code 10001「企业账号不支持该操作」）：不发起该调用，
 	// 端点退化为「刷新额度」——企业额度走 get-enterprise-user-usage 口径（见 upstream）。
 	// 前端对企业号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存前端仍可能调用）。
-	if a.IsEnterprise() {
+	// 国际版无签到活动（2026-10-23 实测）：/billing/meter/daily-checkin 与
+	// /v2/billing/meter/daily-checkin 均返回 400 code=10001「签到活动未开启或已过期」，
+	// 两个候选路径都试过。同口径对照国内账号：同一端点在 CN 正常，且
+	// get-user-resource 的包里带「签到/每日」文案，国际版的包里没有任何签到文案。
+	// 因此这里不发请求（发了也只会拿 400），端点退化为「刷新额度」。
+	// 前端同样按 realm 不渲染签到按钮；此处是 API 侧防御。
+	if a.IsGlobal() {
+		checkinMsg = "国际版无签到活动（已跳过签到，仅刷新额度）"
+		respUnsupported = true
+	} else if a.IsEnterprise() {
 		checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
 	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
 		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
@@ -644,6 +656,9 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{"ok": true, "checkin_done": checkinDone}
 	if a.IsEnterprise() {
 		resp["enterprise"] = true
+	}
+	if respUnsupported {
+		resp["checkin_unsupported"] = true
 	}
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg

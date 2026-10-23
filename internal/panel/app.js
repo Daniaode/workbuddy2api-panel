@@ -451,7 +451,10 @@ function renderAccounts(list) {
         // 企业版无个人成长体系（签到 400「企业账号不支持该操作」/ 成长任务 403）：
         // 不渲染「签到」「任务」按钮，只留「额度」——点它走 /balance，企业额度由
         // upstream 的 get-enterprise-user-usage 口径填充。
-        (s.enterprise ? '' :
+        // 国际版与企业版都没有签到体系（2026-10-23 实测国际版两个候选路径均
+        // 400 code=10001），渲染按钮只会让人以为「点了没成功」——直接不渲染，
+        // 保留「余额」按钮用于刷新额度。
+        ((s.enterprise || s.realm === 'global') ? '' :
           '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
         (s.enterprise ? '' :
@@ -544,7 +547,16 @@ $('accBody').addEventListener('click', async ev => {
   try {
     if (a === 'checkin') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/checkin', { method: 'POST' });
-      toast('签到完成' + (r.credits != null ? '，积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + (r.checkin_message ? '（' + r.checkin_message + '）' : ''), 'ok');
+      // 三个分支必须分开：把「无此功能」显示成「签到完成」会让人以为积分到账了；
+      // 把业务失败显示成成功则会掩盖真正的故障。
+      const bal = (r.credits != null ? '，积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '');
+      if (r.checkin_unsupported) {
+        toast('该账号无签到功能' + bal + (r.checkin_message ? '（' + r.checkin_message + '）' : ''), 'warn');
+      } else if (r.checkin_done) {
+        toast('签到完成' + bal, 'ok');
+      } else {
+        toast('签到未成功' + bal + (r.checkin_message ? '（' + r.checkin_message + '）' : ''), 'warn');
+      }
     } else if (a === 'balance') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/balance', { method: 'POST' });
       toast('余额已更新：' + r.credits + (r.credits_total > 0 ? ' / ' + r.credits_total : ''), 'ok');
