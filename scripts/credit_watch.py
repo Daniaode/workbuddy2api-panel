@@ -22,7 +22,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG = os.path.join(ROOT, "config.json")
@@ -36,6 +36,9 @@ EXPIRY_WARN_HOURS = 72
 GAIN_NOISE = 50
 # 单次余额下降超过它才提示（正常调用消耗本来就该扣，别天天喊）。
 DROP_NOISE = 500
+# 签到连续未成功多少天算异常。取 2 而不是 1：调度时点是 10:00 / 21:00，
+# 当天 21:00 之前「今天还没签」是正常的，用 1 天会在每天上午稳定误报一次。
+CHECKIN_STALE_DAYS = 2
 
 
 class PanelError(RuntimeError):
@@ -104,6 +107,10 @@ def snapshot(base: str, key: str) -> dict:
                 "earliest_remain": a.get("credits_earliest_remaining") or 0,
                 "buckets": a.get("credits_expiry_buckets") or [],
                 "checkin_done": bool(a.get("checkin_done")),
+                # realm 决定该号有没有签到体系：global 账号上游无签到入口，
+                # 调度器对它们直接 continue。不带上这个字段，就会把「本来不签到
+                # 的号」当成「签到坏了」天天报。
+                "realm": a.get("realm") or "cn",
                 "cooling": bool(a.get("cooling")),
                 "disabled": bool(a.get("disabled")),
                 "paused": bool(a.get("paused")),
@@ -125,6 +132,42 @@ def snapshot(base: str, key: str) -> dict:
         "accounts": accounts,
         "compensation": comps,
         "history": hist.get("entries") or [],
+    }
+
+
+def load_pool_state() -> dict:
+    """直接读 data/state.json 取 last_checkin_day 等字段。
+
+    为什么不走面板 API：overview 只透出 checkin_done（布尔），没有「最后一次成功
+    是哪天」。要判断「连续几天没签到」必须拿到原始日期。state.json 是原子替换
+    写入的，只读它不会与网关写路径冲突。
+    """
+    path = os.path.join(ROOT, "data", "state.json")
+    try:
+        raw = json.load(open(path, encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for uid, a in (raw.get("accounts") or {}).items():
+        out[uid] = {
+            "last_checkin_day": a.get("last_checkin_day") or "",
+            "disabled": bool(a.get("disabled")),
+            "paused": bool(a.get("paused")),
+        }
+    return out
+
+
+def load_schedule() -> dict:
+    """读签到排程配置。签到被关掉时不该报「没签到」——那不是故障。"""
+    try:
+        cfg = json.load(open(CONFIG, encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"enabled": True, "hours": [10, 21]}
+    sch = cfg.get("schedule") or {}
+    return {
+        "enabled": sch.get("checkin_enabled", True),
+        "hours": sch.get("checkin_hours") or [10, 21],
+        "include_disabled": sch.get("include_disabled_in_tasks", False),
     }
 
 
@@ -157,6 +200,96 @@ def fmt_pkg(p: dict) -> str:
     return f"{p.get('name','?')} {p.get('remain',0)}/{p.get('size',0)}（到期 {(p.get('end_time') or '')[:10]}）"
 
 
+def checkin_findings(snap: dict, pool: dict, schedule: dict, prev: dict) -> tuple[list[str], dict]:
+    """签到链路健康检查：把「静默失效」变成显式告警。
+
+    为什么需要：签到失败只写进容器日志（易失、重启即丢），而失败的表现不是报错，
+    而是「积分不再增长」。连续几天没人发现，直到余额见底。
+
+    四类必须排除的误报
+      1. global 账号上游无签到入口，调度器直接跳过 —— 永远不会有 last_checkin_day；
+      2. 签到排程被关掉（checkin_enabled=false）—— 不是故障，是配置；
+      3. 刚入池的新号 —— 还没来得及跑第一次签到；
+      4. 当天还没到签到时点 —— 「今天还没签」在上午是正常的。
+
+    返回 (findings, state)，state 含 first_seen 与更新后的 notified。
+    纯函数式：不改传入的 prev，便于测试与重放。
+    """
+    first_seen = dict(prev.get("first_seen") or {})
+    notified = dict(prev.get("notified") or {})
+    now = datetime.now().astimezone()
+    today = now.date()
+
+    if not schedule.get("enabled", True):
+        return [], {"first_seen": first_seen, "notified": notified}
+
+    hours = sorted(int(h) for h in (schedule.get("hours") or [10, 21]))
+    last_slot = hours[-1] if hours else 21
+
+    out: list[str] = []
+    for a in snap["accounts"]:
+        uid = a["uid"]
+        first_seen.setdefault(uid, now.isoformat(timespec="seconds"))
+
+        # 兜底 1：global 无签到体系。
+        if (a.get("realm") or "cn") == "global":
+            continue
+        # 兜底 2：禁用号默认不跑保号任务。
+        if a.get("disabled") and not schedule.get("include_disabled"):
+            continue
+
+        st = pool.get(uid) or {}
+        last_day = (st.get("last_checkin_day") or "").strip()
+
+        # 兜底 3：新号宽限。
+        try:
+            age_days = (now - datetime.fromisoformat(first_seen[uid])).days
+        except (ValueError, TypeError):
+            # 记录损坏按「已满期」处理：宁可报也不静默。
+            age_days = CHECKIN_STALE_DAYS
+
+        # 兜底 4：今天最后一个签到时点还没到，不算失败。
+        # 例：排程 [10, 21]，此刻 11:00 且昨天签过 → 今天还没签是正常的。
+        before_last_slot = now.hour < last_slot
+
+        if not last_day:
+            if age_days < CHECKIN_STALE_DAYS:
+                continue
+            key = f"checkin-never:{uid}"
+            if notified.get(key):
+                continue
+            out.append(
+                f"🚨 **{a['nick']}** 入池 {age_days} 天从未签到成功"
+                f"（`last_checkin_day` 为空）"
+            )
+            notified[key] = now.isoformat(timespec="seconds")
+            continue
+
+        try:
+            days = (today - date.fromisoformat(last_day)).days
+        except ValueError:
+            # 日期格式不认识：静默跳过好过误报。
+            continue
+
+        if days < CHECKIN_STALE_DAYS:
+            continue
+        # 距上次成功已有 N 天，但今天还没到签到时点且 N==CHECKIN_STALE_DAYS
+        # 时仍可能今晚补上 —— 只在时点已过时报。
+        if before_last_slot and days == CHECKIN_STALE_DAYS:
+            continue
+
+        key = f"checkin-stale:{uid}:{today.isoformat()}"
+        if notified.get(key):
+            continue
+        suffix = "（今日排程已过仍未成功）" if not before_last_slot else ""
+        out.append(
+            f"🚨 **{a['nick']}** 签到已 **{days} 天**未成功（最后成功 {last_day}）{suffix}"
+        )
+        notified[key] = now.isoformat(timespec="seconds")
+
+    return out, {"first_seen": first_seen, "notified": notified}
+
+
 def report(snap: dict, floor: int) -> str:
     """全量报表：每次调用都完整，用于人工随时查看。"""
     accts = sorted(snap["accounts"], key=lambda a: -a["credits"])
@@ -177,7 +310,9 @@ def report(snap: dict, floor: int) -> str:
             flags.append("已暂停")
         if a["cooling"]:
             flags.append("冷却中")
-        if not a["checkin_done"]:
+        # global 账号上游无签到入口，调度器直接跳过——不该显示「今日未签到」，
+        # 那会把「本来就没有这个功能」显示成「今天漏了」。
+        if not a["checkin_done"] and (a.get("realm") or "cn") != "global":
             flags.append("今日未签到")
         if a["credits"] < floor:
             flags.append("低于保底")
@@ -328,12 +463,30 @@ def main() -> int:
 
     prev = load_state()
     findings = watch(snap, prev, args.floor)
+
+    # 签到链路检查：与积分变化是两条独立信号，合并到同一份报告里。
+    # 它读 state.json（不读面板），因此面板 401/不可达时仍能工作——不过那时
+    # 上面的 snapshot 已经失败了，这里是「顺手多查一层」而非替代。
+    try:
+        pool = load_pool_state()
+        schedule = load_schedule()
+        ck_findings, ck_state = checkin_findings(snap, pool, schedule, prev)
+    except Exception as e:  # noqa: BLE001
+        # 签到检查自身出错不能拖垮整轮：它只是附加信号。
+        print(f"积分监视：签到检查跳过（{e}）", file=sys.stderr)
+        ck_findings, ck_state = [], {}
+
+    findings = ck_findings + findings
+
+    notified = merge_notified(prev, snap, findings)
+    notified.update(ck_state.get("notified") or {})
     save_state(
         {
             "checked_at": snap["checked_at"],
             "accounts": snap["accounts"],
             "compensation": snap["compensation"],
-            "notified": merge_notified(prev, snap, findings),
+            "notified": notified,
+            "first_seen": ck_state.get("first_seen") or prev.get("first_seen") or {},
         }
     )
     if args.json:
