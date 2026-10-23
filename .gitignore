@@ -12,6 +12,7 @@ data/
 /credit
 /wb2api
 /signin_bin
+/probe_bin
 
 # Config with secrets (use config.example.json)
 config.json
@@ -47,3 +48,6 @@ docs/
 *.zip
 server.exe
 .DS_Store
+
+# Spike 的 Go 构建缓存（不入库）
+.gocache/

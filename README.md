@@ -225,6 +225,178 @@ git log --oneline upstream/main ^main
 git merge upstream/main     # 冲突集中在 README / workflows
 ```
 
+## 🔭 上游协议主动探测
+
+被动等报错只能知道“现在挂了”，知道不了“正在被收紧”。`cmd/probe` 定期发**极轻**的探测请求，在通道真正失效之前发现征兆，并留下可复核的证据。
+
+### 为什么是旁路
+
+经 `/v1/chat/completions` 发探测会同时踩三件事：`Usage.Add` 无差别记账污染用量；`applyErrorPolicy` 被调用，一次 11-128 就把正常账号打进冷却；`Pool.Pick` 与在途租约被探测抢占。
+
+在 handler 加“探测标记头”跳过这些是错的方向——那等于给客户端留一个“别惩罚我”的后门，会掩盖真实故障。
+
+本实现直接复用 `internal/upstream` 的出站管线（同一套 `ChatHeaders` 指纹），但**完全不接触** pool / usage / reqlog / handler：
+
+```
+探测请求 ──▶ internal/upstream.ChatStream ──▶ 上游
+                    │
+                    └─ 观测写 data/probe-history.jsonl（独立的账）
+                       不经过 Usage / Pool / reqlog
+```
+
+实测证据（2026-10-23，6 个账号）：
+
+| 指标 | 旁路探测 | 经网关对照 |
+|---|---|---|
+| HTTP | 200 | 200 |
+| `prompt_tokens` | **31** | 522 |
+| `credit` | **0** | 0 |
+| `usage.json` 指纹 | **前后 sha256 完全一致** | 计入当小时桶 |
+| 池状态（冷却/熔断/连败） | **6 个账号全部未变** | — |
+
+### 三层探测
+
+| 层 | 周期 | 范围 | 请求/天 | 积分/天 | 回答的问题 |
+|---|---|---|---|---|---|
+| L1 通道探活 | 15m | 轮转 1 号 | 96 | ~0 | 通道还能用吗 |
+| L2 全量扫描 | 6h | 全部账号 | 24 | ~0 | 某个号被单独收紧了吗 |
+| L3 全保真 | 1d | 轮转 1 号 | 1 | ~0 | 提示词层被针对了吗 |
+
+请求体压到最小：`max_tokens=1`、prompt 单字符。
+
+```json
+{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"1"}],"max_tokens":1}
+```
+
+**L3 归因纯度约束**：L3 比其他层多依赖一个变量（网关自己的提示词模板），所以它失败只产出 `prompt_layer_diff`，**永不升级为通道故障**。
+
+### 账号选择（五道闸）
+
+探测是为了发现问题；如果它把正常号打进冷却或把触底号烧干，就成了新故障源。按顺序剔除：
+
+| 跳过原因 | 判据 |
+|---|---|
+| `disabled` | `state.json` 中已禁用 |
+| `paused` | 暂停选号 |
+| `cooling` | `until > now` |
+| `low_credit` | 余额 < `pool.credit_floor × 2` |
+| `token_due` | token 2 小时内到期 |
+
+`token_due` 这条很关键：token 快过期时 401 无法区分“该刷了”和“session 真死了”，探测结论会被污染。
+
+**探测绝不刷新 token**：`refreshToken` 有反重放，并发第二次刷新会让整链作废，探测不能碰。
+
+### 探测什么
+
+**协议兼容性**（缺字段即 `protocol_drift`）：帧格式、`[DONE]` 收尾、`choices[].delta`、`model` 回显、`usage.total_tokens`、`usage.credit`、`finish_reason` 枚举。
+
+> ⚠️ `content` **不校验非空**。实测 `max_tokens=1` 时 content 为空、token 落在 `reasoning_content`、`finish_reason=length`。校验 content 会让每次探测都误报。
+
+**错误码分流**：
+
+| code | 含义 | 级别 |
+|---|---|---|
+| `11-128` | 通道校验拒绝 | **critical** |
+| 403 无业务码 | WAF 拦截页 | **critical** |
+| `11102` / `11158` | 模型不存在 / 无权用 | high（触发双模型交叉） |
+| `12153` | session 失效 | medium |
+| `6004` | 模型限流 | **静默**（常态，不报） |
+| `6021` | 渠道满载 | low |
+| **未登记新码** | — | **high，带原文** |
+
+未知码单独出口是核心价值：上游收紧风控时通常**先加新码**，而不是把旧码改成失败。
+
+**延迟基线**：按（来源 × 冷/热 × 账号 × 模型）四层分桶，落 `data/probe-history.jsonl`，保留 30 天。
+
+判定：`TTFB > max(3s, 2.5 × 中位数)` **且连续 2 次**，且样本 ≥20。
+
+> 分桶不是洁癖，是实测撞出来的：冷连接 TTFB 6.6s、复用连接 1.0s，差 6 倍。混在一个桶里中位数会变双峰，任何阈值都判不准。
+>
+> **前 14 天只积累基线，不报 `latency_degraded`**。样本少时中位数不稳，用不稳的基准判异常必然误报；误报几次后人对告警麻木，比不报更糟。
+
+### 双模型交叉：防误报的关键
+
+主模型返回 `11102`/`11158` 时，同账号立刻用备用模型（`glm-5.3-flash`）再试：
+
+| 主 | 备 | 结论 |
+|---|---|---|
+| 失败 | 成功 | `model_level_change`（模型下线/权限调整）—— **不是通道故障** |
+| 失败 | 失败 | `channel_failure`（critical） |
+| 成功 | 失败 | `model_regression` |
+
+没有这一步，上游下线一个模型就会天天报“通道被封”。
+
+### 用法
+
+```bash
+bash scripts/probe.sh l1        # 通道探活
+bash scripts/probe.sh l2        # 全量扫描
+bash scripts/probe.sh l3        # 全保真（带网关提示词）
+
+./probe_bin -mode l1 -dry-run   # 只选号不发请求
+```
+
+构建（容器里没有 Go 工具链，需在宿主机或用 golang 镜像）：
+
+```bash
+docker run --rm -v "$PWD":/src -w /src golang:1.22-alpine \
+  sh -c 'CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o probe_bin ./cmd/probe'
+```
+
+### 退出码：探测故障 ≠ 上游故障
+
+| 码 | 含义 | 自动化行为 |
+|---|---|---|
+| `0` | 探测完成（**含发现异常**） | 无异常 `NO_REPLY`；有异常推正文 |
+| `2` | 探测自身故障（配置/凭证读不到、参数非法） | 失败告警“探测链路异常” |
+| `3` | **覆盖为零**（全部账号被保护规则跳过） | 告警“这轮没探到任何账号” |
+| `4` | 全部网络层失败 | 告警，且**不判定**是上游还是本机出网 |
+
+关键：**上游不可用不走非零退出码**。它是探测正常完成的结果，用正文表达。非零只留给“我没能完成这次探测”——两者混用会让告警失去意义。
+
+### 验证「不污染台账」
+
+这条约束不能靠读代码确认，必须实测。但**用文件哈希是错的方法**：`data/usage.json` 由池子 flusher 每 5 秒原子重写，没有探测时哈希也会变（实测 24 秒内 `f724…` → `bb7d…`）。拿它当判据只能撞运气。
+
+正确判据是差分：探测只可能让记账数涨，不会让真实流量涨。
+
+```
+Δusage.requests  vs  Δrequest-logs 行数
+```
+
+```bash
+python3 scripts/probe_ledger_check.py          # 注入 3 次真实请求 + 跑一轮 L2
+```
+
+实测输出（6 个账号）：
+
+```
+注入真实请求    : 3 次（对照组）
+探测请求数      : 6（l2 × 1 轮）
+Δusage.requests : 3
+Δrequest-logs   : 3
+
+✓ 计数器是活的：3 次真实请求被如实记账
+✓ 两者严格相等：6 次探测一次都没进 usage（若被记账，Δusage 应为 9）
+结论: PASS 探测完全绕开用量台账 ✅
+```
+
+脚本特意**注入真实流量**：只有 `Δ=0/0` 时判据不可证伪，分不清「探测没记账」和「计数器坏了」。先证明计数器活着，再证明探测没进去。
+
+### 定时集成
+
+```bash
+openclaw automations create --every 15m \
+  --name "WorkBuddy 上游通道探测" \
+  --command "bash scripts/probe.sh l1" \
+  --command-cwd "<项目绝对路径>" \
+  --announce --channel telegram --to "<chat id>"
+```
+
+L2 / L3 同法，把 `--every` 换成 `--cron "0 */6 * * *"` / `--cron "0 4 * * *"`，`l1` 换成 `l2` / `l3`。
+
+> **已知局限**：采集是宿主侧独立二进制，不是进程内 scheduler。原因是进程内采集需要重建并重启容器，而这个容器正是 workbuddy 模型的提供方，重启会打断在途推理。代价是 **OpenClaw 停机期间不探测**。等下次低峰部署再把采集挪进进程内（`schedule.probe_*` 已在设计上预留）。
+
 ## 🆚 与上游的差异
 
 本分支相对 [上游 master](https://github.com/Sliverkiss/workbuddy2api) 的增量（均已在真实多账号环境验证）：
