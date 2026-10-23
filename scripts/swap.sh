@@ -13,8 +13,18 @@ set -uo pipefail
 
 ROOT="/root/.openclaw/workspace/workbuddy2api-panel"
 LOG="/root/.openclaw/workspace/workbuddy2api-panel/data/swap.log"
-NEW_IMAGE="workbuddy2api-panel-wb2api:next"
-OLD_IMAGE="workbuddy2api-panel-wb2api:rollback-20261023-2238"
+NEW_IMAGE="${NEW_IMAGE:-workbuddy2api-panel-wb2api:next}"
+# 回滚目标：默认取最近一次 rollback-* tag。写死具体 tag 会让每次部署都要改脚本，
+# 而改脚本本身又是一次可能出错的编辑——回滚路径最不该依赖人工同步。
+if [[ -z "${OLD_IMAGE:-}" ]]; then
+    OLD_IMAGE=$(docker images --format '{{.Repository}}:{{.Tag}}' \
+        | grep 'workbuddy2api-panel-wb2api:rollback' | sort | tail -1)
+fi
+if [[ -z "$OLD_IMAGE" ]]; then
+    echo "找不到回滚镜像，拒绝执行（宁可不动，也不要在没有退路时切换）" >&2
+    exit 1
+fi
+echo "回滚目标: $OLD_IMAGE"
 
 exec >>"$LOG" 2>&1
 echo "======== $(date '+%F %T') swap start ========"
