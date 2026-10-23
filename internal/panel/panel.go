@@ -278,8 +278,8 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"model_locks": p.cfg.Pool.ModelLockView(),
 		// 到期提醒快照的节奏与年龄：界面轮询是 5 秒级，但卡片数据只随余额后台刷新
 		// 更新（默认每 5 分钟）——把这两个数透出，前端才能如实标注「x 分钟前更新」。
-		"balance_refresh_sec":    p.balanceRefreshSec(),
-		"balance_refreshed_at":   p.balanceRefreshedAt(),
+		"balance_refresh_sec":  p.balanceRefreshSec(),
+		"balance_refreshed_at": p.balanceRefreshedAt(),
 	})
 }
 
@@ -501,6 +501,10 @@ func panelModelEntry(realm string, mi upstream.ModelInfo, remoteEfforts []string
 	}
 	if mi.PromoNote != "" {
 		entry["promo_note"] = mi.PromoNote
+	}
+	// 截止时刻用结构化字段，不让前端去正则解析 promo_note 里的 "Oct 12 - Oct 25"。
+	if !mi.PromoUntil.IsZero() {
+		entry["promo_until"] = mi.PromoUntil.Format(time.RFC3339)
 	}
 	if mi.MaxAllowedSize > 0 {
 		entry["max_allowed_size"] = mi.MaxAllowedSize

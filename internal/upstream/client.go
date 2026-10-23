@@ -1307,6 +1307,12 @@ type ModelInfo struct {
 	PromoCredits string   // 折扣后倍率原文（如 "0x" / "0.50x"），仅展示
 	PromoLabel   string   // 徽章文案（限时免费 / 夜间折扣 / 错峰使用）
 	PromoNote    string   // hover 说明原文（含时段/日期描述）
+	// PromoUntil 优惠截止时刻（schedule.validUntil 的结构化形式）；零值 = 无明确截止。
+	//
+	// 为什么要单独透出：PromoNote 是给人读的文案（"Oct 12 - Oct 25: ..."），
+	// 从中正则抽日期既不稳定也不该做——中英文格式不同、跨月跨年还要推年份。
+	// 上游本来就有 machine-readable 的 validUntil，直接透出即可让调用方算"还剩几天"。
+	PromoUntil time.Time
 }
 
 // dynModelEntry 上游模型目录（CN /console 与 global /v2 同构）的单条模型解析形态，
@@ -1734,6 +1740,12 @@ func applyModelPromotions(out map[string]ModelInfo, promos []v3ModelPromotion) {
 			f := c.p.Discount.Factor
 			mi.PromoFactor = &f
 			mi.PromoCredits = c.p.Discount.DiscountedCredits
+		}
+		// 截止时刻：只在解析成功时填，解析失败保持零值（宁可不报到期，也不编造）。
+		if c.p.Schedule != nil && c.p.Schedule.ValidUntil != "" {
+			if until, err := time.Parse(time.RFC3339, c.p.Schedule.ValidUntil); err == nil {
+				mi.PromoUntil = until.In(promoZone)
+			}
 		}
 		out[id] = mi
 	}

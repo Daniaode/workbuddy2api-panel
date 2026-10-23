@@ -381,6 +381,23 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 	if mi.ReasoningSummary != "" {
 		entry["reasoning_summary"] = mi.ReasoningSummary
 	}
+	// 限时优惠透出到 /v1/models：调用方据此知道「当前这个模型实际免费」。
+	//
+	// 为什么值得给客户端看：promo_factor=0 意味着上游按 0 倍率结算，但 credits
+	// 字段是**牌价**（转正后的价格），只看它会把免费模型误当成收费。实测确认
+	// global:deepseek-v4.1-flash 牌价 "x0.00" 且真实 usage.credit=0。
+	//
+	// promo_until 是结构化截止时刻（RFC3339），不是让人去正则解析 promo_note
+	// 里的 "Oct 12 - Oct 25"——那种解析在中英文、跨年场景下都会出错。
+	if mi.PromoFactor != nil {
+		entry["promo_factor"] = *mi.PromoFactor
+		if !mi.PromoUntil.IsZero() {
+			entry["promo_until"] = mi.PromoUntil.Format(time.RFC3339)
+		}
+	}
+	if mi.PromoLabel != "" {
+		entry["promo_label"] = mi.PromoLabel
+	}
 	return entry
 }
 

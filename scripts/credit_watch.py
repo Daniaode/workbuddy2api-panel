@@ -39,6 +39,9 @@ DROP_NOISE = 500
 # 签到连续未成功多少天算异常。取 2 而不是 1：调度时点是 10:00 / 21:00，
 # 当天 21:00 之前「今天还没签」是正常的，用 1 天会在每天上午稳定误报一次。
 CHECKIN_STALE_DAYS = 2
+# 免费模型优惠到期提醒窗口（小时）。实测 step-5-preview 的限免 3 天后结束，
+# 提前 72h 提醒才来得及安排迁移或确认续期。
+PROMO_EXPIRY_WARN_HOURS = 72
 
 
 class PanelError(RuntimeError):
@@ -89,6 +92,15 @@ def snapshot(base: str, key: str) -> dict:
     pk = get(base, key, "/panel/api/packages")
     comp = get(base, key, "/panel/api/compensation")
     hist = get(base, key, "/panel/api/credit_history?limit=200")
+    # 免费模型优惠：接口缺失/旧版本时给空列表，不影响其余观测。
+    try:
+        md = get(base, key, "/panel/api/models")
+        promos = [
+            m for m in (md.get("models") or [])
+            if m.get("promo_factor") == 0
+        ]
+    except PanelError:
+        promos = []
 
     pkgs: dict[str, list] = {}
     for a in pk.get("accounts") or []:
@@ -132,6 +144,7 @@ def snapshot(base: str, key: str) -> dict:
         "accounts": accounts,
         "compensation": comps,
         "history": hist.get("entries") or [],
+        "promos": promos,
     }
 
 
@@ -198,6 +211,50 @@ def pkg_key(p: dict) -> str:
 
 def fmt_pkg(p: dict) -> str:
     return f"{p.get('name','?')} {p.get('remain',0)}/{p.get('size',0)}（到期 {(p.get('end_time') or '')[:10]}）"
+
+
+def promo_findings(snap: dict, prev: dict) -> tuple[list[str], dict]:
+    """免费模型优惠到期提醒。
+
+    为什么单独做：限免不是账户资产，不存在于 state.json 或积分流水里，只有
+    /panel/api/models 的 promo_until 才知道。一旦静默过期，同一个模型会突然开始
+    扣积分——而用户以为是免费的，直到余额掉下去才发现。
+
+    数据来源是上游 /v3/config 的 schedule.validUntil（结构化字段），不是从
+    promo_note 的 "Oct 12 - Oct 25" 文案里正则抽日期：那种解析在中英文、跨年、
+    缺年份的场景下都会错。
+
+    兼容性：promo_until 需要网关版本支持（本仓库已实现）；旧版本没有该字段时
+    本函数静默跳过——不猜、不误报。
+    """
+    now = datetime.now().astimezone()
+    notified = dict(prev.get("notified") or {})
+    out: list[str] = []
+
+    for m in snap.get("promos") or []:
+        raw = m.get("promo_until")
+        if not raw:
+            continue
+        try:
+            until = datetime.fromisoformat(raw)
+        except (ValueError, TypeError):
+            continue
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=now.tzinfo)
+        hours = (until - now).total_seconds() / 3600
+        if not (0 <= hours <= PROMO_EXPIRY_WARN_HOURS):
+            continue
+        key = f"promo:{m.get('id')}:{raw[:10]}"
+        if notified.get(key):
+            continue
+        note = m.get("promo_note") or ""
+        out.append(
+            f"⏰ 免费模型 **{m.get('id')}** 将在 {raw[:10]} 结束限免"
+            f"（剩 {hours:.0f}h）{('——' + note) if note else ''}"
+        )
+        notified[key] = now.isoformat(timespec="seconds")
+
+    return out, {"notified": notified}
 
 
 def checkin_findings(snap: dict, pool: dict, schedule: dict, prev: dict) -> tuple[list[str], dict]:
@@ -476,10 +533,17 @@ def main() -> int:
         print(f"积分监视：签到检查跳过（{e}）", file=sys.stderr)
         ck_findings, ck_state = [], {}
 
-    findings = ck_findings + findings
+    try:
+        promo_fs, promo_state = promo_findings(snap, prev)
+    except Exception as e:  # noqa: BLE001
+        print(f"积分监视：优惠到期检查跳过（{e}）", file=sys.stderr)
+        promo_fs, promo_state = [], {}
+
+    findings = ck_findings + promo_fs + findings
 
     notified = merge_notified(prev, snap, findings)
     notified.update(ck_state.get("notified") or {})
+    notified.update(promo_state.get("notified") or {})
     save_state(
         {
             "checked_at": snap["checked_at"],

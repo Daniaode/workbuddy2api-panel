@@ -640,6 +640,13 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 			"该账号为企业版/企业切换会话（token_source=enterprise_switch），无个人成长体系，成长任务行为事件会被上游忽略；请移除账号后以个人身份重新登录")
 		return
 	}
+	if a.IsGlobal() {
+		writeErr(w, http.StatusUnprocessableEntity,
+			"该账号为国际版（realm=global），其成长任务是不带积分奖励的等级解锁清单；"+
+				"国内任务码在国际版不存在，执行只会产生无效上游请求。"+
+				"国际版唯一可获积分入口是连登（连续 14 天 +50 / 28 天 +150）")
+		return
+	}
 	var body struct {
 		TaskCode string `json:"task_code"`
 	}
@@ -1280,6 +1287,13 @@ func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	if a.IsEnterpriseSession() {
 		writeErr(w, http.StatusUnprocessableEntity,
 			"该账号为企业版/企业切换会话（token_source=enterprise_switch），无个人成长体系，成长任务行为事件会被上游忽略；请移除账号后以个人身份重新登录")
+		return
+	}
+	if a.IsGlobal() {
+		writeErr(w, http.StatusUnprocessableEntity,
+			"该账号为国际版（realm=global），其成长任务是不带积分奖励的等级解锁清单；"+
+				"国内任务码在国际版不存在，执行只会产生无效上游请求。"+
+				"国际版唯一可获积分入口是连登（连续 14 天 +50 / 28 天 +150）")
 		return
 	}
 	// per-account 互斥（与单任务动作共用一把锁）：重复点击 409。
