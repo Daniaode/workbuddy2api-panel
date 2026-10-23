@@ -19,19 +19,18 @@
 ---
 
 > [!IMPORTANT]
-> **项目已停止维护（2026-10-21）**：后续不再更新代码、不跟进上游变化、不再处理新的 issue / PR。
+> **本项目为自维护分支（fork 自 `linguo2625469/workbuddy2api-panel`）**：上游已于 **2026-10-21** 声明停止维护，本仓库接手持续维护。
 >
-> 原因有三：
-> 1. **上游已开始禁用反代**——WorkBuddy 对非官方客户端的识别与拦截正在收紧（通道校验、账号限制等），反代通道的稳定性与存活周期已不可控，继续做适配意义有限；
-> 2. **个人精力有限**——本项目本就是个人自用工具，无力长期跟进协议变化与风控对抗；
-> 3. **非法转卖泛滥**——发现大量批量注册小号、对外售卖额度、二次加壳 / 卡密分发的滥用行为，与本项目初衷完全相悖。
+> 维护范围：
+> 1. **跟进上游协议变化**——WorkBuddy 对非官方客户端的通道校验与风控在持续收紧，本分支负责发现问题并做适配；
+> 2. **积分活动观测**——内置 `scripts/credit_watch.py` 与定时自动化，盯余额变动、新到账积分包、限时补偿与到期作废，明细见[积分活动监视](#-积分活动监视)；
+> 3. **缺陷修复与功能迭代**——issue / PR 正常处理。
 >
-> 仓库保持现状可用（已合入的修复不会回退），但请自行评估风险：**上游随时可能彻底收紧导致不可用**；因使用非官方客户端导致的账号风控 / 封禁，由使用者自行承担。
+> **风险提示**：本分支能延长可用周期，但不能保证上游永不彻底封禁；因使用非官方客户端导致的账号风控 / 封禁，由使用者自行承担。
 >
-> **维护方式披露**：本仓库近期的 issue / PR 处置、代码审查、测试与修复实现**大量由 AI 辅助完成**（自动化编码 agent），合并与发布决策由维护者作出。请知悉后再使用或参与贡献。
+> **维护方式披露**：本仓库的 issue / PR 处置、代码审查、测试与修复实现**大量由 AI 辅助完成**（OpenClaw 自动化编码 agent），合并与发布决策由维护者作出。请知悉后再使用或参与贡献。
 
-> **本项目是 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的增强分支**（fork）。
-> 上游仓库现已删除；本项目**已同步至上游删库前的最后一次更新**（`ea8b1e5`），此后由本分支独立维护演进。
+> **代系**：本项目是 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的增强分支（上游已删库），经由 [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) 演进；**本仓库已同步至 `73a7560`（上游停止维护声明前的最后一次提交）**，此后独立维护。
 > 在上游基础上重构了可视化运维层；差异概览见 [与上游的差异](#-与上游的差异)，上游设计的精巧之处（账号池调度、错误分类、提示词体系）原样保留，详见下文。
 
 > ⚠️ **本项目仅限自用账号（签到 / 保活 / 个人工具接入），不支持同时也是禁止批量小号分发额度、二次打包或收费售卖。** 详见 [使用声明（必读）](#使用声明必读)。
@@ -161,6 +160,47 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 成长中心连登档位（连续登录 7/14/28 天）兑换后发放积分 / 能量 / 补签卡 / **抽奖次数**，抽奖次数只能从兑换获得。网关把它挂在每日签到排程末尾自动跑闭环（见[定时任务](#定时任务)）：档位解锁当天自动兑换、有抽奖次数自动抽完，全程无需人工盯。
 
+## 📈 积分活动监视
+
+面板能看**当前**余额，但看不清**活动在给什么**——新到账的积分包、限时补偿、快到期要作废的余额，都需要比昨天多一点才知道。`scripts/credit_watch.py` 补这一层：只读面板已有的四类观测（`overview` / `packages` / `compensation` / `credit_history`），**不发任何上游写请求**，因此不抢账号池额度、不干扰冷却与在途租约。
+
+### 它盯什么
+
+| 观测 | 数据源 | 何时出声 |
+|---|---|---|
+| 余额变化 | `credit_history` + `overview.credits` | 单次增长 ≥ 50 或下降 ≥ 500（正常调用消耗不唧唧） |
+| 新积分包到账 | `packages[].package_code` | 出现未记录过的 `package_code` 且面额 > 0 |
+| 限时补偿 | `compensation` | `active && !claimed && credit_num > 0`，同一截止日只提醒一次 |
+| 快到期的余额 | `credits_expiry_buckets` | 72h 内到期且仍有剩余，同一批次只提醒一次 |
+| 账号异常 | `overview` | 跌破 `pool.credit_floor`、被禁用、进入冷却、签到从未完成→完成 |
+
+### 用法
+
+```bash
+python3 scripts/credit_watch.py report           # 全量报表（人读，任何时候想看就看）
+python3 scripts/credit_watch.py report --json    # 原始快照（喂给别的工具）
+python3 scripts/credit_watch.py watch            # 只报「需要动作/值得知道」的变化
+python3 scripts/credit_watch.py watch --quiet    # 无变化时输出 NO_REPLY（给定时任务用）
+```
+
+- 鉴权与地址从同目录 `config.json` 读取（`api_key` + `listen`），**不写死密钥**；面板不可达或密钥错误时退出码为 `2`，让定时任务能区分「没变化」与「监视瞎了」。
+- 首次 `watch` 只建基线（`data/credit-watch-state.json`），不会把历史包刷满屏；提醒记录只保留 7 天。
+- 阈值都在文件顶部常量里（`GAIN_NOISE` / `DROP_NOISE` / `EXPIRY_WARN_HOURS` / `DEFAULT_FLOOR`），要改直接改，不必改逻辑。
+
+### 定时集成
+
+OpenClaw 侧用一条 command 自动化跑 `watch --quiet`，无变化时由 `NO_REPLY` 静默，有变化才推送到聊天：
+
+```bash
+openclaw automations create --every 20m \
+  --name "WorkBuddy 积分活动监视" \
+  --command "python3 scripts/credit_watch.py watch --quiet" \
+  --command-cwd "<项目绝对路径>" \
+  --announce --channel telegram --to "<chat id>"
+```
+
+`data/` 与 `config.json` 均已被 `.gitignore` 排除，基线文件不会进版本库。
+
 ## 🆚 与上游的差异
 
 本分支相对 [上游 master](https://github.com/Sliverkiss/workbuddy2api) 的增量（均已在真实多账号环境验证）：
@@ -247,7 +287,7 @@ mkdir -p auths data && cp config.example.json config.json
 docker run -d --name workbuddy2api \
   -p 7863:7863 -e TZ=Asia/Shanghai \
   -v ./auths:/app/auths -v ./data:/app/data -v ./config.json:/app/config.json \
-  ghcr.io/linguo2625469/workbuddy2api-panel:latest
+  ghcr.io/daniaode/workbuddy2api-panel:latest
 
 # 3. 健康检查（无可用账号时返回 503）
 curl -s http://localhost:7863/healthz
@@ -263,7 +303,7 @@ curl -s http://localhost:7863/healthz
 
 ```bash
 # 1. 克隆
-git clone https://github.com/linguo2625469/workbuddy2api-panel.git
+git clone https://github.com/Daniaode/workbuddy2api-panel.git
 cd workbuddy2api-panel
 
 # 2. 准备配置（compose 挂载此文件，缺失会导致容器启动失败）
