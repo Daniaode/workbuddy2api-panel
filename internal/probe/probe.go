@@ -41,6 +41,7 @@ const (
 	LevelL1 Level = "l1" // 通道探活（最小请求）
 	LevelL2 Level = "l2" // 全量扫描（每号一次）
 	LevelL3 Level = "l3" // 全保真（带网关提示词）
+	LevelL4 Level = "l4" // 辅助链路（只读：余额 / 补偿 / 连登）
 )
 
 // Chatter 探测所需的最小上游能力。生产用 *upstream.Client，测试注入假实现。
@@ -112,6 +113,8 @@ type Finding struct {
 // Probe 一次探测的执行体。
 type Probe struct {
 	Chat Chatter
+	// Aux 辅助链路能力（L4 用）。nil 时 RunAux 返回空——chat 层不依赖它。
+	Aux Aux
 	// Primary 主探测模型（裸名，不带 realm 前缀）。
 	Primary string
 	// Fallback 交叉验证用备用模型。

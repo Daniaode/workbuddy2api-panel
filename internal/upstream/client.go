@@ -2275,7 +2275,12 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 // 关键：到期时刻统一走 packageEffectiveEnd（DeductionEndTime 优先）。此前本函数只读
 // CycleEndTime，把「个人体验版」的月度周期重置日（如 2026-10-31）当成了到期日，而它
 // 真实的可抵扣窗口到 2034/2035 年——首页快照因此长期错报最近到期时间与数量。
-func (c *Client) UserResourceSnapshot(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, buckets []ExpiryBucket, err error) {
+// userResourceCore 余额查询的核心实现：发起请求并解析，**不触发余额观察者**。
+//
+// 拆出来的理由：探测需要「只读地查一次余额」，而观察者会把这个结果写进积分流水。
+// 探测写的流水不是真实变动，会污染「什么时候变成多少」这条时间线，所以探测必须
+// 走一条不通知观察者的路径。
+func (c *Client) userResourceCore(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, buckets []ExpiryBucket, err error) {
 	// 企业版额度不在「个人资源包」体系内：get-user-resource* 对 enterpriseId 非空账号
 	// 恒返回空 Accounts（实测 code 0 且 Accounts null），故分流到企业口径端点。
 	if a.IsEnterprise() {
@@ -2287,7 +2292,6 @@ func (c *Client) UserResourceSnapshot(a *auth.Auth, soon time.Duration) (remain,
 				Remain:   earliestRemaining,
 			}}
 		}
-		c.notifyCredits(a, remain, err)
 		return
 	}
 	now := time.Now()
@@ -2388,8 +2392,22 @@ func (c *Client) UserResourceSnapshot(a *auth.Auth, soon time.Duration) (remain,
 	if len(buckets) > 0 {
 		earliestRemaining = buckets[0].Remain
 	}
-	c.notifyCredits(a, remain, nil)
 	return remain, total, expiring, earliestAt, earliestRemaining, buckets, nil
+}
+
+// UserResourceSnapshot 余额快照（含到期批次），成功时通知余额观察者。
+// 调度器与面板走这条；探测走 UserResourceReadOnly。
+func (c *Client) UserResourceSnapshot(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, buckets []ExpiryBucket, err error) {
+	remain, total, expiring, earliestAt, earliestRemaining, buckets, err = c.userResourceCore(a, soon)
+	c.notifyCredits(a, remain, err)
+	return remain, total, expiring, earliestAt, earliestRemaining, buckets, err
+}
+
+// UserResourceReadOnly 只读查余额：语义与 UserResourceSnapshot 完全一致，但
+// **不通知余额观察者**——探测不是观测值，写进积分流水会造出假变动。
+func (c *Client) UserResourceReadOnly(a *auth.Auth) (remain, total int64, err error) {
+	remain, total, _, _, _, _, err = c.userResourceCore(a, 0)
+	return remain, total, err
 }
 
 // SetCreditObserver 挂载/注销（nil）余额观察者。可在启动后任意时刻调用；

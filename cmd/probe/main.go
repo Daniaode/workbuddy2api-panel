@@ -82,9 +82,9 @@ func main() {
 
 	level := probe.Level(*mode)
 	switch level {
-	case probe.LevelL1, probe.LevelL2, probe.LevelL3:
+	case probe.LevelL1, probe.LevelL2, probe.LevelL3, probe.LevelL4:
 	default:
-		fmt.Fprintf(os.Stderr, "probe: 未知 mode %q（l1 / l2 / l3）\n", *mode)
+		fmt.Fprintf(os.Stderr, "probe: 未知 mode %q（l1 / l2 / l3 / l4）\n", *mode)
 		os.Exit(exitSelfFault)
 	}
 
@@ -115,7 +115,9 @@ func main() {
 		TokenMargin: 2 * time.Hour,
 	})
 
-	// 目标集合：L1/L3 轮转一个号；L2 全部可探号。
+	// 目标集合：L1/L3/L4 轮转一个号；L2 全部可探号。
+	// L4 也轮转而不是全量：辅助链路每号 3 次调用，全量会让每轮打到 18 次，
+	// 而它要发现的是「域级」变化，单号足以代表。
 	var targets []probe.Candidate
 	if level == probe.LevelL2 {
 		for _, c := range cands {
@@ -156,6 +158,7 @@ func main() {
 	}
 	p := &probe.Probe{
 		Chat:       chat,
+		Aux:        chat, // *upstream.Client 同时实现 Chatter 与 Aux
 		Primary:    *primary,
 		Fallback:   *fallback,
 		PromptText: promptText,
@@ -165,6 +168,41 @@ func main() {
 	entries := hist.Load(time.Now())
 	var findings []probe.Finding
 	var attempts []probe.Attempt
+	var auxAttempts []probe.AuxAttempt
+
+	// L4 走独立路径：辅助链路没有 SSE 流，也没有模型维度，因此不走 Run/Judge。
+	// 它同样不参与延迟基线——余额查询的耗时与 chat 的 TTFB 不是同一个量纲。
+	if level == probe.LevelL4 {
+		for _, t := range targets {
+			got := p.RunAux(level, t.Auth)
+			auxAttempts = append(auxAttempts, got...)
+			for _, a := range got {
+				_ = hist.Append(auxToHistory(a))
+			}
+			findings = append(findings, probe.JudgeAux(got)...)
+		}
+
+		allNetwork := len(auxAttempts) > 0
+		for _, a := range auxAttempts {
+			if !a.Network {
+				allNetwork = false
+				break
+			}
+		}
+		report := renderAux(level, auxAttempts, findings, &st)
+		if err := saveAlertState(stateFile, st); err != nil {
+			fmt.Fprintf(os.Stderr, "probe: 保存状态失败: %v\n", err)
+		}
+		if strings.TrimSpace(report) == "" {
+			fmt.Println("NO_REPLY")
+		} else {
+			fmt.Println(report)
+		}
+		if allNetwork {
+			os.Exit(exitAllNetwork)
+		}
+		os.Exit(exitOK)
+	}
 
 	for _, t := range targets {
 		att := p.Run(level, t.Auth, level == probe.LevelL3)
@@ -332,6 +370,92 @@ func render(level probe.Level, attempts []probe.Attempt, findings []probe.Findin
 			b.WriteString(" · ")
 		}
 		fmt.Fprintf(&b, "%s=%d/%dms", a.Nick, a.Status, a.TTFBMs)
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
+// auxToHistory 辅助链路记录。TTFB 与 TotalMs 同值——这些端点没有流式语义，
+// 首字节即响应体，拆两个时间点没有观测意义。
+func auxToHistory(a probe.AuxAttempt) probe.HistoryEntry {
+	return probe.HistoryEntry{
+		Time: time.Now(), Level: a.Level, Source: "bypass",
+		UID: a.UID, Nick: a.Nick, Model: a.Endpoint,
+		Status: a.Status, Code: a.Code, TTFBMs: a.TotalMs, TotalMs: a.TotalMs,
+		OK: a.OK(), Drift: a.Drift,
+	}
+}
+
+// renderAux 辅助链路的报告。去重与翻转规则与 render 完全一致（同一份
+// alertState、同一套 6 小时窗口），只是观测摘要换成端点维度。
+func renderAux(level probe.Level, attempts []probe.AuxAttempt, findings []probe.Finding, st *alertState) string {
+	now := time.Now()
+
+	var critNow []string
+	for _, f := range findings {
+		if f.Level == "critical" {
+			critNow = append(critNow, f.UID+"|"+f.Code)
+		}
+	}
+	sort.Strings(critNow)
+	flipped := diffStrings(st.LastCritical, critNow)
+
+	if st.Notified == nil {
+		st.Notified = map[string]time.Time{}
+	}
+	var fresh []probe.Finding
+	for _, f := range findings {
+		key := f.UID + "|" + f.Code
+		if last, ok := st.Notified[key]; ok && now.Sub(last) < dedupWindow && !contains(flipped, key) {
+			continue
+		}
+		fresh = append(fresh, f)
+		st.Notified[key] = now
+	}
+	for k, ts := range st.Notified {
+		if now.Sub(ts) > 7*24*time.Hour {
+			delete(st.Notified, k)
+		}
+	}
+	st.LastCritical = critNow
+	st.UpdatedAt = now
+
+	if len(fresh) == 0 {
+		if len(flipped) > 0 {
+			lines := []string{fmt.Sprintf("**探测状态变化**（%s）", level), ""}
+			for _, k := range flipped {
+				lines = append(lines, "- 解除："+k)
+			}
+			return strings.Join(lines, "\n")
+		}
+		return ""
+	}
+
+	sort.SliceStable(fresh, func(i, j int) bool {
+		return sevRank(fresh[i].Level) < sevRank(fresh[j].Level)
+	})
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "**WorkBuddy 辅助链路探测**（%s）\n\n", level)
+	for _, f := range fresh {
+		fmt.Fprintf(&b, "- [%s] %s\n", f.Level, f.Detail)
+		if f.Evidence != "" {
+			fmt.Fprintf(&b, "  ```\n  %s\n  ```\n", strings.ReplaceAll(truncate(f.Evidence, 200), "\n", " "))
+		}
+	}
+	if len(flipped) > 0 {
+		b.WriteString("\n状态翻转：")
+		b.WriteString(strings.Join(flipped, ", "))
+		b.WriteString("\n")
+	}
+
+	// 观测摘要按端点列出：漏掉哪个端点比「哪个号失败」更常是根因。
+	b.WriteString("\n观测：")
+	for i, a := range attempts {
+		if i > 0 {
+			b.WriteString(" · ")
+		}
+		fmt.Fprintf(&b, "%s=%d/%dms", a.Endpoint, a.Status, a.TotalMs)
 	}
 	b.WriteString("\n")
 	return b.String()

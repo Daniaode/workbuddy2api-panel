@@ -42,8 +42,16 @@ var knownCodes = map[string]codeMeta{
 //	{"code":"11-128",...}     带横线的通道校验码
 var codeRe = regexp.MustCompile(`"code"\s*:\s*"?([0-9][0-9\-]{0,9})"?`)
 
+// codeEqRe 兜底：internal/upstream 把错误信封归一化成 `code=11140 msg=...` 的文案
+// 形态（见 doJSON 的 Error.Msg 构造），此时 JSON 键值正则匹配不到。
+// 两条都要有，否则「上游明确拒绝」会被降级成笼统的 HTTP 错误，错误码分流整个失效。
+var codeEqRe = regexp.MustCompile(`\bcode=([0-9][0-9\-]{0,9})`)
+
 // msgRe 提取伴随文案，未知码要原样带出才可诊断。
 var msgRe = regexp.MustCompile(`"(?:msg|message)"\s*:\s*"((?:[^"\\]|\\.){0,200})"`)
+
+// msgEqRe 兜底：同一归一化文案里的 `msg=...`（取到行尾或下一个 key 为止）。
+var msgEqRe = regexp.MustCompile(`\bmsg=([^\n]{0,200})`)
 
 // ExtractCode 从上游错误体中提取业务码与文案。
 //
@@ -55,9 +63,13 @@ func ExtractCode(body string) (code, msg string) {
 	}
 	if m := codeRe.FindStringSubmatch(body); len(m) > 1 {
 		code = m[1]
+	} else if m := codeEqRe.FindStringSubmatch(body); len(m) > 1 {
+		code = m[1]
 	}
 	if m := msgRe.FindStringSubmatch(body); len(m) > 1 {
 		msg = truncate(unescapeJSON(m[1]), 200)
+	} else if m := msgEqRe.FindStringSubmatch(body); len(m) > 1 {
+		msg = truncate(strings.TrimSpace(m[1]), 200)
 	}
 	return code, msg
 }
