@@ -5,47 +5,51 @@
 # 作者仍可能悄悄修一个致命 bug。这里只在**确有新提交**时出声，其余时候
 # 输出 NO_REPLY 让自动化静默（命令型自动化按沉默标记处理）。
 #
+# 判据用 git 而不是 gh API：Gateway 的定时任务环境没有 GH_TOKEN，
+# 而公开仓库的 fetch 匿名可用，也不吃 API 限流。
+#   - 已合并的上游提交是 main 的祖先，merge-base == upstream HEAD 即「无新提交」；
+#   - 上游前进后 merge-base 落在后面，二者之间就是待同步的提交。
+#
 # 用法: bash scripts/upstream_check.sh
-# 退出码: 0 正常（含无更新）；非 0 = gh 查询失败，自动化应视为异常。
+# 退出码: 0 正常（含无更新）；2 fetch 失败（自动化应视为异常，别当成没更新）。
 set -uo pipefail
 
-UPSTREAM_OWNER="linguo2625469"
-UPSTREAM_REPO="${UPSTREAM_OWNER}/workbuddy2api-panel"
-FORK_REPO="Daniaode/workbuddy2api-panel"
+UPSTREAM_URL="https://github.com/linguo2625469/workbuddy2api-panel.git"
+cd "$(dirname "$0")/.." || exit 3
 
-if ! command -v gh >/dev/null 2>&1; then
-    echo "upstream_check: 未安装 gh" >&2
-    exit 3
-fi
+# 上游 remote 可能不存在（新 clone 只带 origin）；补齐，不动 origin。
+git remote get-url upstream >/dev/null 2>&1 || git remote add upstream "$UPSTREAM_URL"
 
-# 跨仓库 compare 的 head 必须写成 "<owner>:<branch>"，写成完整 repo 路径会 404
-# （GitHub 只认 fork 关系里的 owner 前缀，不解析第二段路径）。
-if ! cmp=$(gh api "repos/${FORK_REPO}/compare/main...${UPSTREAM_OWNER}:main" 2>&1); then
-    echo "upstream_check: 查询失败: ${cmp}" >&2
+if ! git fetch --quiet upstream main 2>/dev/null; then
+    echo "upstream_check: 拉取上游失败（网络或仓库不可达）" >&2
     exit 2
 fi
 
-ahead=$(printf '%s' "$cmp" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("ahead_by",0))')
-status=$(printf '%s' "$cmp" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("status",""))')
+head=$(git rev-parse upstream/main)
+base=$(git merge-base main upstream/main 2>/dev/null)
 
-if [[ "$ahead" == "0" ]]; then
+if [[ -z "$base" ]]; then
+    echo "upstream_check: 本地 main 与上游无共同祖先，需人工确认" >&2
+    exit 2
+fi
+
+if [[ "$head" == "$base" ]]; then
     echo "NO_REPLY"
     exit 0
 fi
 
-echo "**上游有新提交**（${UPSTREAM_REPO}，${ahead} 个，status=${status}）"
+count=$(git rev-list --count "${base}..${head}")
+echo "**上游有新提交**（linguo2625469/workbuddy2api-panel，${count} 个）"
 echo
-printf '%s' "$cmp" | python3 - <<'PY'
-import json, sys
-d = json.load(sys.stdin)
-for c in d.get("commits", [])[-10:]:
-    msg = (c["commit"]["message"].splitlines() or [""])[0]
-    print(f"- {c['sha'][:7]} {msg}")
-print()
-print("同步方式：")
-print("```bash")
-print("cd /root/.openclaw/workspace/workbuddy2api-panel")
-print("git fetch upstream && git log --oneline upstream/main ^main   # 先看差异")
-print("git merge upstream/main   # 或按提交 cherry-pick")
-print("```")
-PY
+git log --oneline --no-decorate -10 "${base}..${head}" | sed 's/^/- /'
+[[ "$count" -gt 10 ]] && echo "- …（另有 $((count - 10)) 个）"
+cat <<'EOF'
+
+同步方式（先看差异再合，别让上游盖掉本分支的面板与积分监视改动）：
+
+```bash
+cd /root/.openclaw/workspace/workbuddy2api-panel
+git log --oneline upstream/main ^main
+git merge upstream/main     # 冲突通常集中在 README / workflows
+```
+EOF
