@@ -201,6 +201,30 @@ openclaw automations create --every 20m \
 
 `data/` 与 `config.json` 均已被 `.gitignore` 排除，基线文件不会进版本库。
 
+### 上游提交巡检
+
+上游已声明停更，但“声明停更”不等于“永不提交”。`scripts/upstream_check.sh` 用一次 compare API 判断是否真有新提交，有则列出最近提交与合并命令，无则输出 `NO_REPLY`：
+
+```bash
+bash scripts/upstream_check.sh        # 无更新 → NO_REPLY；有更新 → 提交列表
+```
+
+```bash
+openclaw automations create --every 6h \
+  --name "WorkBuddy 上游提交巡检" \
+  --command "bash scripts/upstream_check.sh" \
+  --command-cwd "<项目绝对路径>" \
+  --announce --channel telegram --to "<chat id>"
+```
+
+同步时先看差异再合，不要直接 `git pull` 盖掉本分支的面板与积分监视改动：
+
+```bash
+git fetch upstream
+git log --oneline upstream/main ^main
+git merge upstream/main     # 冲突集中在 README / workflows
+```
+
 ## 🆚 与上游的差异
 
 本分支相对 [上游 master](https://github.com/Sliverkiss/workbuddy2api) 的增量（均已在真实多账号环境验证）：
