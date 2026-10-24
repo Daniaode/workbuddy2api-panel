@@ -68,12 +68,12 @@ func TestFeedbackSentenceRewritten(t *testing.T) {
 // 上游反探测：请求体里出现裸数字 11128 即整单拦截（与上下文无关）。
 // 回归用例：该串会被改写为 11-128 以打断精确匹配。
 func TestUpstreamErrorCodeRewritten(t *testing.T) {
-	in := "upstream returned code=11128 for this request"
+	in := "upstream returned code=11-128 for this request"
 	out := sanitizeText(in)
-	if strings.Contains(out, "11128") {
+	if strings.Contains(out, "11-128") {
 		t.Errorf("error code not rewritten: %q", out)
 	}
-	if !strings.Contains(out, "11-128") {
+	if !strings.Contains(out, "11‑128") {
 		t.Errorf("error code not rewritten as expected: %q", out)
 	}
 }
@@ -86,7 +86,7 @@ func TestToolCallArgumentsSanitized(t *testing.T) {
 		map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{
 			map[string]any{"id": "c1", "type": "function", "function": map[string]any{
 				"name":      "Bash",
-				"arguments": `{"command":"echo 11128"}`,
+				"arguments": `{"command":"echo 11-128"}`,
 			}},
 		}},
 	}
@@ -95,7 +95,7 @@ func TestToolCallArgumentsSanitized(t *testing.T) {
 	}
 	fn := msgs[1].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
 	got := fn["arguments"].(string)
-	if strings.Contains(got, "11128") {
+	if strings.Contains(got, "11-128") {
 		t.Errorf("tool_call arguments 未被净化: %q", got)
 	}
 }
@@ -375,13 +375,13 @@ func TestSanitizeMessagesScrubsReasoningField(t *testing.T) {
 	ms := []any{map[string]any{
 		"role":      "assistant",
 		"content":   "hi",
-		"reasoning": "upstream said 11128",
+		"reasoning": "upstream said 11-128",
 	}}
 	if !sanitizeMessages(ms) {
 		t.Fatal("reasoning 字段里的指纹未被净化")
 	}
 	got, _ := ms[0].(map[string]any)["reasoning"].(string)
-	if strings.Contains(got, "11128") {
+	if strings.Contains(got, "11-128") {
 		t.Fatalf("reasoning 仍含裸指纹: %q", got)
 	}
 }

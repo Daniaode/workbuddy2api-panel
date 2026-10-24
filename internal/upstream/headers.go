@@ -100,11 +100,14 @@ func (c *Client) userAgent(a *auth.Auth) string {
 // billingUA 白名单类（billing/checkin/banner）出站 UA：单段 `WorkBuddy/<clientVersion>`
 // （官方 banner 显式覆写形态，不带 CLI 段）。默认生效（伪造官方桌面端指纹）；
 // 显式 client_name="SaaS" 才不设 UA（还原旧行为，Go 默认 UA）。
-func (c *Client) billingUA() string {
-	if c == nil || c.attributionClientName() == "SaaS" {
+func (c *Client) billingUA(a *auth.Auth) string {
+	if c == nil || c.attributionClientName(a) == "SaaS" {
 		return ""
 	}
-	return "WorkBuddy/" + c.clientVersion()
+	// 单段 UA 同样要跟账号域走：global 账号的归属头是 `WorkBuddy AI`，
+	// billing UA 若固定 `WorkBuddy/`，两者在同一个请求里前后不一致。
+	name := c.attributionClientName(a)
+	return name + "/" + c.clientVersion()
 }
 
 // resolveDeviceToken 解析本次请求的 X-Device-Token 取值。
@@ -285,7 +288,7 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 		c.injectGlobalChatHeaders(req, a)
 	}
 	// 用量归属头：默认伪造 WorkBuddy 桌面端指纹（client_name="SaaS" 还原旧行为）。
-	c.injectAttribution(req)
+	c.injectAttribution(req, a)
 	if !c.legacyHeaders() {
 		// 官方对话请求另带这三个头（docs/official-client.md）：
 		//   X-Agent-Intent/X-Agent-Type 标识 agent 调用意图与类型；
@@ -388,9 +391,16 @@ func validTraceID(s string) bool {
 
 // attributionClientName 生效的用量归属名：ClientName 非空取之；
 // 空默认 "WorkBuddy"（伪造官方桌面端指纹；显式配 "SaaS" 可还原旧行为）。
-func (c *Client) attributionClientName() string {
+func (c *Client) attributionClientName(a *auth.Auth) string {
 	if c != nil && c.ClientName != "" {
 		return c.ClientName
+	}
+	// 归属头必须与 UA 的平台段一致：UA 对 global 账号发 `WorkBuddy AI/<ver>`，
+	// 而 X-IDE-Name / X-IDE-Type 若固定 `WorkBuddy`，上游按「UA 产品名 vs 归属头」
+	// 做一致性校验会判为不是官方客户端，返回 400 / code 11-128（request illegal）。
+	// 实测来源：社区分支 enticingns/workbuddy2api-panel 的 dc172a6。
+	if a != nil && a.IsGlobal() {
+		return "WorkBuddy AI"
 	}
 	return "WorkBuddy"
 }
@@ -402,8 +412,8 @@ func (c *Client) attributionClientName() string {
 // + X-IDE-Name/Type/Product="WorkBuddy" + X-IDE-Version=client_version，上游用量归因
 // 不再出现 client/agentPurpose 为空的「网关特征」。显式 ClientName="SaaS" 还原旧行为
 // （仅 X-Product="SaaS"，不设 X-IDE-*）；配其他值则四头跟随该值。
-func (c *Client) injectAttribution(req *http.Request) {
-	name := c.attributionClientName()
+func (c *Client) injectAttribution(req *http.Request, a *auth.Auth) {
+	name := c.attributionClientName(a)
 	if name == "SaaS" {
 		req.Header.Set("X-Product", "SaaS")
 		return
@@ -473,7 +483,7 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	}
 	if c != nil && c.UserAgent != "" {
 		req.Header.Set("User-Agent", c.UserAgent)
-	} else if ua := c.billingUA(); ua != "" {
+	} else if ua := c.billingUA(a); ua != "" {
 		req.Header.Set("User-Agent", ua)
 	}
 	if a.UID != "" {

@@ -19,7 +19,17 @@ var sanitizeFeatures = []string{
 	"Main branch (",              // 注入指令句（截断前缀即可命中）
 	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
 	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
-	"11128",                                           // 上游反探测：裸数字错误码
+	"11-128",                                          // 上游反探测：裸数字错误码（真实错误码是 ASCII 连字符）
+	// DSH（DeepSeek Harness）身份句：上游对「自我介绍句式 + 品牌」做大小写不敏感的
+	// 连续子串匹配，命中即 400 / 11-128。单个品牌词、改词或去掉句式都放行。
+	// 预检用截断前缀，让下方 sanitizeDshRe 兜底层能跑起来。
+	"DeepSeek Harness", // DSH 品牌名
+	"powered by",       // 身份句动词
+	"built on",         // 身份句动词
+	"built by",         // 身份句动词
+	"created by",       // 身份句动词
+	"developed by",     // 身份句动词
+	"trained by",       // 身份句动词
 }
 
 // sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
@@ -73,10 +83,28 @@ var sanitizeRewrites = [][2]string{
 		// 上游据此识别"在讨论/回显其内部错误码"的请求。
 		// 代价：用户对话中任何 11128 都会被改写——但这串数字出现在请求里本身就是拦截条件，
 		// 不改写必然失败。插入连字符保留可读性与指代（零宽空格无效，实测上游会归一化）。
-		"11128",
 		"11-128",
+		"11‑128",
 	},
 }
+
+// sanitizeDshRe DSH（DeepSeek Harness）身份句兜底正则：匹配「自我介绍句式 + 品牌」
+// 的任意组合，无论用哪个动词、哪个品牌、带几个修饰词。上游对这类整句做大小写
+// 不敏感的连续子串匹配，命中即 400 / 11-128。
+//
+// 结构：You are <修饰词 0~3> <名词 agent|assistant|model 或省略> <动词> <品牌>
+//
+//	动词：powered by / built on / built by / created by / developed by / made by / trained by
+//	品牌：[\w.-]+（覆盖 DeepSeek、deepseek-v4.1-flash、Harness、OpenAI 等）
+//
+// 分词修饰宾语（"You are free to use tools built by X"）不含 "You are [agent|assistant]"
+// 前缀，本正则不匹配，保持原样——那是用户数据，不该改写。
+//
+// 来源：社区分支 enticingns/workbuddy2api-panel 的 5d81941（2026-10-24）。
+var sanitizeDshRe = regexp.MustCompile(
+	`(?i)\bYou are (?:\w+ ){0,3}(?:agent|assistant|model)?\s*,?\s*` +
+		`(?:powered by|built on|built by|created by|developed by|made by|trained by)\s+` +
+		`(?:the )?[\w.-]+(?: [A-Za-z][\w.-]*)?(?: model)?\s*[.,]?`)
 
 // sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。
 func sanitizeText(text string) string {
@@ -86,6 +114,9 @@ func sanitizeText(text string) string {
 	for _, rw := range sanitizeRewrites {
 		text = strings.ReplaceAll(text, rw[0], rw[1])
 	}
+	// DSH 身份句兜底：精确模板句已由 sanitizeRewrites 处理，
+	// 本正则只接「任意动词 + 任意品牌」的变体。
+	text = sanitizeDshRe.ReplaceAllString(text, "You are a helpful AI assistant.")
 	if sanitizeHdrRe.MatchString(text) {
 		text = sanitizeHdrRe.ReplaceAllString(text, "")
 	}
