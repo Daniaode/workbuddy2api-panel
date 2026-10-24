@@ -12,12 +12,14 @@ import (
 // 校验后，缺 X-Conversation-ID 的聊天请求会 400 / 11-128（conversation id
 // missing）。即使调用方没给会话 ID（零值 ChatMeta），三元组也必须齐全。
 //
-// 形态按官方逐一区分（docs/official-client.md「会话 id 与链路头」）：
-//   - X-Conversation-ID：带连字符的 uuidv7（36 位），整段对话不变；
-//   - X-Conversation-Request-ID / X-Conversation-Message-ID：uuidv7 去掉连字符（32 位）。
+// 形态按官方逐一区分（依据：官方 5.8.3 Windows 安装包，见 docs/official-client.md）：
+//   - X-Conversation-ID：带连字符的 UUID **v4**（36 位）。桌面端 SessionImpl 构造
+//     函数里 `this.id = generateUUUID()`，其版本位是 `i[6]=15&i[6]|64`（0x40 = v4）；
+//   - X-Conversation-Request-ID / X-Conversation-Message-ID：UUID **v7** 去掉
+//     连字符（32 位）。`generateConversationRequestId()` = `uuidv7().replace(/-/g,"")`。
 //
-// 此前这里统一断言 32 hex——那是旧实现的形态，与官方不一致。两种形态实测都返回
-// 200，所以对齐不会引发 11-128。
+// 三者版本位不同是有意为之，不是笔误：会话是 v4，轮次与消息是 v7。
+// 此前这里统一断言 32 hex（更早）与统一 v7（更晚）都不对，已按包内证据修正。
 func TestChatHeadersAlwaysSendConversationTrio(t *testing.T) {
 	c := &Client{}
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/v2/chat/completions", nil)
@@ -26,17 +28,17 @@ func TestChatHeadersAlwaysSendConversationTrio(t *testing.T) {
 	}
 	c.ChatHeaders(req, testAuth(), "", ChatMeta{})
 
-	// 36 位带连字符的 uuidv7（版本位 7、RFC 9562 变体位）。
-	uuid7Dashed := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
-	// 32 位十六进制（uuidv7 去连字符）。
-	hex32 := regexp.MustCompile(`^[0-9a-f]{32}$`)
+	// 36 位带连字符的 UUID v4（版本位 4、RFC 9562 变体位）。
+	uuid4Dashed := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	// 32 位十六进制，且版本位为 7（uuidv7 去连字符）。
+	uuid7Hex := regexp.MustCompile(`^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$`)
 
 	conv := req.Header.Get("X-Conversation-ID")
 	if conv == "" {
 		t.Fatal("X-Conversation-ID missing (通道校验会拒绝缺少会话三元组的请求)")
 	}
-	if !uuid7Dashed.MatchString(conv) {
-		t.Errorf("X-Conversation-ID = %q, want 36 位带连字符 uuidv7（官方形态）", conv)
+	if !uuid4Dashed.MatchString(conv) {
+		t.Errorf("X-Conversation-ID = %q, want 36 位带连字符 UUID v4（官方 SessionImpl 形态）", conv)
 	}
 	for _, h := range []string{
 		"X-Conversation-Request-ID",
@@ -46,8 +48,8 @@ func TestChatHeadersAlwaysSendConversationTrio(t *testing.T) {
 		if v == "" {
 			t.Fatalf("%s missing (通道校验会拒绝缺少会话三元组的请求)", h)
 		}
-		if !hex32.MatchString(v) {
-			t.Errorf("%s = %q, want 32 hex（官方去掉连字符）", h, v)
+		if !uuid7Hex.MatchString(v) {
+			t.Errorf("%s = %q, want 32 hex 且版本位为 7（官方 uuidv7 去连字符）", h, v)
 		}
 	}
 }

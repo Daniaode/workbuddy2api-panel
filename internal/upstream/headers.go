@@ -14,12 +14,23 @@ import (
 
 const (
 	// defaultClientVersion 出站 WorkBuddy 客户端版本段（UA 的 `WorkBuddy/<ver>` 与
-	// 白名单头组的 X-IDE-Version）。对齐官方 WorkBuddy Desktop 分发包版本（5.5.4）。
+	// X-IDE-Version）。
+	//
+	// 取值依据（A 级，官方 5.8.3 Windows 安装包）：
+	//   resources/app.asar.unpacked/cli/product.json 的 genieVersion = "5.8.3"；
+	//   安装包文件名 WorkBuddy-win32-x64-user-5.8.3.41334564-db0e9b51.exe；
+	//   product.json 的 commit = db0e9b51...、date = 2026-10-15。
+	//
 	// config upstream.client_version 可覆盖（空 = 内置默认）。
-	defaultClientVersion = "5.5.4"
-	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。对齐官方内置 CLI（2.137.1）。
+	defaultClientVersion = "5.8.3"
+	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。
+	//
+	// 取值依据（A 级，同一安装包）：内置 CLI 的 bundle 里
+	// publishConfig.customPackage.name = "@tencent-ai/codebuddy-code"，
+	// version = "2.161.0"。
+	//
 	// config upstream.cli_version 可覆盖（空 = 内置默认）。
-	defaultCliVersion = "2.137.1"
+	defaultCliVersion = "2.161.0"
 
 	// deploymentType 官方 product.json 的 deploymentType（两个安装包都是 SaaS），
 	// 由 ProductEndpointHttpInterceptor 作为 X-Product 加到每个请求上。
@@ -165,8 +176,11 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req.Header.Set("User-Agent", c.userAgent(a))
-	// Accept-Language 按 realm 切：CN zh-CN，global en-US。
-	req.Header.Set("Accept-Language", acceptLanguageFor(a))
+	// Accept-Language：官方**通用请求不发**，只有积分包查询带（短值 zh/en，
+	// 见 BillingHeaders）。legacy 保留旧的按 realm 长值行为。
+	if c.legacyHeaders() {
+		req.Header.Set("Accept-Language", acceptLanguageFor(a))
+	}
 
 	if c.legacyHeaders() {
 		// ── legacy：保留 2026-09 那套「防风控」推断头 ──
@@ -184,11 +198,22 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	// ── official：照官方客户端的实际取值 ──
 	// Accept 用官方的宽松值；chat 路径随后覆盖为流式形态。
 	req.Header.Set("Accept", "application/json, text/plain, */*")
-	// X-Request-ID：32 位十六进制，每个请求新生成（官方 CommonHeaderHttpInterceptor）。
-	// chat 路径随后用消息级 id 覆盖同一个头，与官方一致。
-	req.Header.Set("X-Request-ID", session.NewMessageID())
+	// X-Request-ID：32 位十六进制，每个请求新生成。
+	// 官方的 injectRequestIdHeader 用 generateUUUID()（UUID v4）去连字符，
+	// 所以这里也用 v4 形态，而不是无版本位的随机 hex。
+	// chat 路径随后用消息级 uuidv7 覆盖同一个头，与官方一致。
+	req.Header.Set("X-Request-ID", session.NewUUIDv4Hex())
 	// 不发 Origin / Referer / X-CodeBuddy-Request / X-Machine-ID / X-Session-ID：
 	// 实测四组对照（chat、余额、成长任务、连登）去掉后全部 200，见 docs/official-client.md。
+}
+
+// billingAcceptLanguage 官方积分包查询用的 Accept-Language 短值。
+// 国际版账号取 `en`，国内版 `zh`（与官方按界面语言取值等价：非英文即 zh）。
+func billingAcceptLanguage(a *auth.Auth) string {
+	if a != nil && a.IsGlobal() {
+		return "en"
+	}
+	return "zh"
 }
 
 // acceptLanguageFor 按账号 realm 返回 Accept-Language：global → en-US，cn → zh-CN。
@@ -319,10 +344,12 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	// 不再因为「透传优先」而漏发该头（issue #190）。
 	conversationID := meta.ConversationID
 	if conversationID == "" {
-		// 官方 X-Conversation-ID 是**带连字符**的 uuidv7（36 位，见
-		// docs/official-client.md「会话 id 与链路头」）；轮次/消息 id 才是
-		// 去掉连字符的 32 位。这里此前统一用 32 hex，形态与官方不同。
-		conversationID = session.NewUUIDv7()
+		// 官方 X-Conversation-ID 是**带连字符的 UUID v4**（36 位）。
+		// 依据（官方 5.8.3 Windows 安装包）：SessionImpl 构造函数里
+		// `this.id = generateUUUID()`，而 generateUUUID 的版本位是
+		// `i[6]=15&i[6]|64`（0x40 = 版本 4），返回值带连字符。
+		// 注意与轮次/消息 id 区分：那两者是 uuidv7 去连字符。
+		conversationID = session.NewUUIDv4()
 	}
 	req.Header.Set("X-Conversation-ID", conversationID)
 	req.Header.Set("X-Conversation-Request-ID", convReqID)
@@ -435,8 +462,15 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	c.injectCodeBuddyRequest(req)
-	// Accept-Language 按 realm 切（D5，billing 域未走 CommonHeaders，单独注入）。
-	req.Header.Set("Accept-Language", acceptLanguageFor(a))
+	// Accept-Language：官方只在积分包查询（get-user-resource* / summary）带这个头，
+	// 取值是**短值** `zh` / `en`（来源：app.asar 的 fetchResourcePackagesPage，
+	// `headers:{"Accept-Language":n}`，n 由 CODEBUDDY_IDE_STORAGE_LANG 决定，
+	// 以 en 开头取 `en`，否则 `zh`）。billing 域走这里，正好覆盖那批端点。
+	if c.legacyHeaders() {
+		req.Header.Set("Accept-Language", acceptLanguageFor(a))
+	} else {
+		req.Header.Set("Accept-Language", billingAcceptLanguage(a))
+	}
 	if c != nil && c.UserAgent != "" {
 		req.Header.Set("User-Agent", c.UserAgent)
 	} else if ua := c.billingUA(); ua != "" {

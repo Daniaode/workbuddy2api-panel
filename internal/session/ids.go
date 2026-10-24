@@ -46,17 +46,12 @@ func ResolveConversationID(body []byte) string {
 	return strOrEmpty(obj["conversationId"])
 }
 
-// NewMessageID 生成消息级 ID：32 位 hex（UUID v4 去横线的长度形态），对齐官方
-// X-Request-ID / X-Conversation-Message-ID。crypto/rand 失败（理论上不可能）时回落
-// math/rand/v2 双 uint64 拼 32 hex——恒 32 hex、恒合法，可安全用作 B3 TraceId。
-func NewMessageID() string {
-	b := make([]byte, 16)
-	if _, err := cryptorand.Read(b); err == nil {
-		return hex.EncodeToString(b)
-	}
-	// 熵源故障的极端兜底：仍保证 32 hex（fallbackID 不 panic、不空串）。
-	return fmt.Sprintf("%016x%016x", uint64(rand.Uint64())|1, rand.Uint64())
-}
+// NewMessageID 生成对话消息级 32 位十六进制 ID（UUID v7 去连字符）。
+//
+// 依据（官方 5.8.3 安装包）：对话的 X-Conversation-Message-ID / X-Request-ID
+// 都是 `uuidv7().replace(/-/g,"")`。非对话请求的 X-Request-ID 另用 v4，
+// 见 NewUUIDv4Hex。
+func NewMessageID() string { return NewUUIDv7Hex() }
 
 // deriveSalt 进程启动随机盐：对所有稳定聚合 ID 的纯派生统一加盐，使派生值无法
 // 按外部可控的键内容（会话键/轮级键）被预计算；重启换新（重启时旧对话轮/会话已
@@ -77,7 +72,24 @@ func RequestIDForKey(key string) string {
 		return NewMessageID()
 	}
 	sum := sha256.Sum256([]byte(deriveSalt + "|" + key))
-	return hex.EncodeToString(sum[:16])
+	return forceV7(sum[:16])
+}
+
+// forceV7 把任意 16 字节的版本位改成 UUID v7、变体位改成 RFC 9562。
+//
+// 为什么派生值也要做：官方对客户端传入的 conversationRequestId 有断言
+// 「must be a lowercase UUIDv7 encoded as 32 hexadecimal characters」。
+// 上游目前不校验（实测任意 32 hex 均 200），但派生值天然缺版本位——
+// 两个字节的代价换形态一致，没有理由不做。
+func forceV7(b []byte) string {
+	if len(b) < 16 {
+		return hex.EncodeToString(b)
+	}
+	out := make([]byte, 16)
+	copy(out, b[:16])
+	out[6] = 0x70 | out[6]&0x0f
+	out[8] = 0x80 | out[8]&0x3f
+	return hex.EncodeToString(out)
 }
 
 // TurnKey 派生「对话轮级」聚合键：body 里**最后一条** role=="user" 消息的
@@ -227,7 +239,7 @@ func TurnRequestID(turnKey string) string {
 		return NewMessageID()
 	}
 	sum := sha256.Sum256([]byte(deriveSalt + "|" + turnKey))
-	return hex.EncodeToString(sum[:16])
+	return forceV7(sum[:16])
 }
 
 // ─── 官方 ID 形态生成器（UUID v7）─────────────────────────────────────────
@@ -244,6 +256,33 @@ func TurnRequestID(turnKey string) string {
 func NewUUIDv7() string {
 	h := NewUUIDv7Hex()
 	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
+}
+
+// NewUUIDv4 返回带连字符的 UUID v4（8-4-4-4-12）。
+//
+// 官方用它生成**会话 id**（X-Conversation-ID）：桌面端 SessionImpl 构造函数里
+// `this.id = generateUUUID()`，而 generateUUUID 的版本位是 `i[6]=15&i[6]|64`
+// （0x40 = 版本 4），且返回值带连字符。这一点与轮次/消息 id 不同——那两者是
+// uuidv7 去连字符。见 docs/official-client.md。
+func NewUUIDv4() string {
+	h := NewUUIDv4Hex()
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
+}
+
+// NewUUIDv4Hex 返回去掉连字符的 UUID v4（32 位小写十六进制）。
+//
+// 官方用它生成**非对话请求的 X-Request-ID**：`injectRequestIdHeader` 里
+// `generateUUUID().replace(/-/g,"")`。对话请求的 X-Request-ID 另用消息级
+// uuidv7 覆盖（见 upstream.ChatHeaders）。
+func NewUUIDv4Hex() string {
+	var b [16]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		binary.BigEndian.PutUint64(b[0:], rand.Uint64())
+		binary.BigEndian.PutUint64(b[8:], rand.Uint64())
+	}
+	b[6] = 0x40 | b[6]&0x0f // 版本 4
+	b[8] = 0x80 | b[8]&0x3f // RFC 9562 变体
+	return hex.EncodeToString(b[:])
 }
 
 // NewUUIDv7Hex 返回去掉连字符的 UUID v7（32 位小写十六进制）。
