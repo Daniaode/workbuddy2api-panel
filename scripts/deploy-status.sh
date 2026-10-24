@@ -21,7 +21,12 @@ if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
 fi
 
 RUNNING_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER" 2>/dev/null)
-IMAGE_CREATED=$(docker inspect -f '{{.Created}}' "$RUNNING_IMAGE" 2>/dev/null | cut -c1-19)
+# 保留完整的 RFC3339（含时区偏移）。此前用 cut -c1-19 把 "+09:00" 截掉，
+# 于是 date -d 按本地时区重新解释，算出的 epoch 偏了 8–9 小时——镜像明明比提交旧，
+# 却被判成「无待部署」。时区必须跟着时间串一起留着。
+IMAGE_CREATED_FULL=$(docker inspect -f '{{.Created}}' "$RUNNING_IMAGE" 2>/dev/null)
+IMAGE_CREATED="${IMAGE_CREATED_FULL%%[.+Z]*}"   # 仅用于显示：去掉偏移/纳秒/Z
+IMAGE_CREATED="${IMAGE_CREATED%%.*}"
 echo "  容器:     $CONTAINER  $(docker ps --filter name=$CONTAINER --format '{{.Status}}')"
 echo "  镜像:     $RUNNING_IMAGE"
 echo "  构建于:   ${IMAGE_CREATED//T/ }"
@@ -85,7 +90,7 @@ fi
 
 # 已提交但尚未重建的部分：只看触及镜像内容的提交。
 LAST_COMMIT_TS=$(git log -1 --format='%ct')
-IMAGE_TS=$(date -d "${IMAGE_CREATED//T/ }" +%s 2>/dev/null || echo 0)
+IMAGE_TS=$(date -d "$IMAGE_CREATED_FULL" +%s 2>/dev/null || echo 0)
 
 PENDING_COMMITS=""
 if [[ "$IMAGE_TS" -lt "$LAST_COMMIT_TS" ]]; then
