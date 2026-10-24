@@ -515,7 +515,7 @@ func (p *Panel) runSequentialEventTask(a *auth.Auth, code string, primary, fallb
 func runSequentialAutomation(p *Panel, a *auth.Auth) (string, error) {
 	return p.runSequentialEventTask(a, "Sequential_Tasks_4",
 		func() error {
-			return p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopAutomationCreateEvent("wb2api 自动化"))
+			return p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopAutomationCreateEvent(automationTaskName))
 		}, nil)
 }
 
@@ -882,12 +882,18 @@ func runBuddyApp(p *Panel, a *auth.Auth) (string, error) {
 	return "已上报 buddyapp 进入五连事件（同时覆盖 Buddy_App 与 Buddy_App_QQ）", nil
 }
 
+// automationTaskName 定时任务创建事件里的任务名。
+//
+// 官方这是用户在表单里自己填的名字；网关取一个普通用户会起的典型值。
+// 旧实现直接写 "wb2api 自动化" —— 这串字符会出现在上报事件里，等于自报家门。
+const automationTaskName = "每日资讯简报"
+
 // runAutomationCreate 完成 automation_1（设置自动化任务）。
 // 2026-09-12 两账号实测：automated_task_create_suc 事件纯 API 上报即点亮，
 // 无需真实创建定时任务。
 func runAutomationCreate(p *Panel, a *auth.Auth) (string, error) {
 	if err := p.cfg.Upstream.ReportDesktopEvent(a,
-		upstream.DesktopAutomationCreateEvent("wb2api 自动化")); err != nil {
+		upstream.DesktopAutomationCreateEvent(automationTaskName)); err != nil {
 		return "", err
 	}
 	return "已上报定时任务创建事件", nil
@@ -937,7 +943,9 @@ func runSkillFresh(p *Panel, a *auth.Auth) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("真实对话: %w", err)
 	}
-	msgID := "msg-" + req[len(req)-8:]
+	// 消息 id 用官方形态（uuidv7 去连字符）；旧写法 "msg-<后8位>" 是自造形状。
+	// 必须复用同一个值：同一消息的 chat 链与 skill_info 事件要指向同一条消息。
+	msgID := session.NewUUIDv7Hex()
 	events := upstream.DesktopChatSequence(conv, req, msgID, "fast-model", "fast-model")
 	for _, ev := range events {
 		if ev["eventCode"] == "chat_message_response" {
@@ -989,7 +997,7 @@ func runExpertLighthouse(p *Panel, a *auth.Auth) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("真实对话: %w", err)
 	}
-	events := upstream.DesktopChatSequence(conv, req, "msg-"+req[len(req)-8:], "fast-model", "fast-model")
+	events := upstream.DesktopChatSequence(conv, req, session.NewUUIDv7Hex(), "fast-model", "fast-model")
 	for _, ev := range events {
 		if ev["eventCode"] == "agent_task_created" {
 			ev["has_expert"] = true
@@ -1032,7 +1040,13 @@ func runAppearance(p *Panel, a *auth.Auth) (string, error) {
 // 2026-09-12 三账号实测：agent_task_created_with_template + template_used 事件组
 // （JOIN chat 链）一次上报 5 组即 5/5 点亮。template_id 服务端不校验真实性。
 func runTemplateUse(p *Panel, a *auth.Auth) (string, error) {
-	templates := [][2]string{{"1", "深度研究"}, {"2", "周报生成"}, {"3", "竞品分析"}, {"4", "活动策划"}, {"5", "代码评审"}}
+	// 模板 id / 名称取自官方模板目录（download.codebuddy.cn/plugin-marketplace/scenes-v2.json，
+	// 2026-10-24 实测可达）。此前这里是编造的 "1".."5" 与自拟名称——id 形状与官方的
+	// 两位数字段不符，名称也不在官方目录里。
+	templates := [][2]string{
+		{"50", "深度研究"}, {"47", "创作文档"}, {"48", "分析数据"},
+		{"49", "制作PPT"}, {"51", "策划方案"},
+	}
 	for i, tp := range templates {
 		conv := session.NewUUIDv7Hex()
 		req := session.NewUUIDv7Hex()
@@ -1112,7 +1126,7 @@ func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (strin
 			continue
 		}
 		// 使用事件（JOIN 服务端 requestId）+ chat 链。
-		events := append(upstream.DesktopChatSequence(conv, req, "msg-"+req[len(req)-8:], "fast-model", "fast-model"),
+		events := append(upstream.DesktopChatSequence(conv, req, session.NewUUIDv7Hex(), "fast-model", "fast-model"),
 			upstream.DesktopExpertActualUseEvent(e, conv, req))
 		if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
 			fail++

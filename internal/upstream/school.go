@@ -132,7 +132,8 @@ func SchoolChatTimesEvents(conversationID string) map[string]any {
 		"recommendId": "", "skillId": "", "skillCount": 0, "totalCount": 0,
 		"traceId": rid, "rootRequestId": rid,
 		"parentConversationId": conversationID, "conversationId": conversationID,
-		"messageId": "msg-" + rid[len(rid)-8:],
+		// 消息 id 用官方形态（uuidv7 去连字符）；旧写法 "msg-<后8位>" 是自造形状。
+		"messageId": session.NewUUIDv7Hex(),
 		"agentName": "mp", "agentType": "main",
 		"codebuddy.session_id":              conversationID,
 		"codebuddy.conversation_request_id": rid,

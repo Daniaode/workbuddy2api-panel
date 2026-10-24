@@ -306,7 +306,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 // template_used {template_id,task_mode}，JOIN 一条完整 chat 链。
 // 三账号实测：5 组（不同模板）一次上报 → 5/5 点亮。
 func DesktopTemplateUseSequence(conversationID, requestID, templateID, templateName string) []DesktopEvent {
-	events := DesktopChatSequence(conversationID, requestID, "msg-"+templateID, "fast-model", "fast-model")
+	events := DesktopChatSequence(conversationID, requestID, session.NewUUIDv7Hex(), "fast-model", "fast-model")
 	events = append(events,
 		DesktopEvent{
 			"eventCode": "agent_task_created_with_template", "mode": "working",
@@ -321,7 +321,7 @@ func DesktopTemplateUseSequence(conversationID, requestID, templateID, templateN
 // web_element_click(playbook_ctaClick) + playbook_cta_click + playbook_prompt_send
 // （Dialog 发送 Prompt，带 conversationId/requestId JOIN chat 链）。三账号实测 1/1 点亮。
 func DesktopPlaybookPromptSequence(conversationID, requestID, caseID, caseName string) []DesktopEvent {
-	events := DesktopChatSequence(conversationID, requestID, "msg-pb", "fast-model", "fast-model")
+	events := DesktopChatSequence(conversationID, requestID, session.NewUUIDv7Hex(), "fast-model", "fast-model")
 	payload := map[string]any{
 		"id": caseID, "name": caseName, "type": "document",
 		"categoryId": "", "categoryName": "",
@@ -353,7 +353,7 @@ func DesktopPlaybookPromptSequence(conversationID, requestID, caseID, caseName s
 // wbx_design_canvas_task_create + wbx_design_canvas_open（Ardot create_design 工具
 // 完成时客户端经 metrics 通道上报，同一 /v2/report 端点）。三账号实测 1/1 点亮。
 func DesktopDesignCanvasSequence(conversationID, requestID string) []DesktopEvent {
-	events := DesktopChatSequence(conversationID, requestID, "msg-canvas", "fast-model", "fast-model")
+	events := DesktopChatSequence(conversationID, requestID, session.NewUUIDv7Hex(), "fast-model", "fast-model")
 	return append(events,
 		DesktopEvent{
 			"eventCode": "wbx_design_canvas_task_create", "conversationId": conversationID,
@@ -583,7 +583,7 @@ func desktopExpertActualUse(e MarketExpert, conversationID, requestID string) De
 		"id":        e.ExpertID, "name": e.DisplayNameZH, "expertTitle": e.ProfessionZH,
 		"type": cat, "expertType": e.ExpertType, "source": "builtin", "version": ver,
 		"cost": 9000, "characterCount": 14,
-		"conversationId": conversationID, "requestId": requestID, "messageId": "msg-" + requestID[len(requestID)-8:],
+		"conversationId": conversationID, "requestId": requestID, "messageId": session.NewUUIDv7Hex(),
 		"requestModelId": "fast-model", "requestModelName": "fast-model",
 	}
 }
