@@ -61,6 +61,10 @@ func TestProbeBodyHasMinimalMessage(t *testing.T) {
 
 // availTTL 必须跟随自动探测间隔：固定 24h 会让一次静默失败后的旧结论冒充现状，
 // 比诚实显示「待验证」更糟。
+//
+// 同时必须压住全量重探频率：TTL 直接决定「多久把 35 个模型全部重探一遍」，
+// 而重探一轮是 35 个真实 chat 请求。早期按 interval×3 算，30m 间隔得到 90m
+// TTL，折算 560 请求/天全压在单个 global 号上——所以下限提到 6h（140 请求/天）。
 func TestAvailTTLFollowsInterval(t *testing.T) {
 	cases := []struct {
 		interval time.Duration
@@ -69,8 +73,10 @@ func TestAvailTTLFollowsInterval(t *testing.T) {
 	}{
 		{0, availTTLManual, "自动探测关闭 → 手动模式 24h"},
 		{-1 * time.Second, availTTLManual, "负值视同关闭"},
-		{30 * time.Minute, 90 * time.Minute, "3 倍间隔（容忍连丢两轮）"},
-		{1 * time.Minute, 15 * time.Minute, "钳下限：短间隔不让证据在两轮间凭空过期"},
+		{30 * time.Minute, availTTLFloor, "3×间隔=90m 低于 6h 下限 → 取下限，压住重探频率"},
+		{1 * time.Minute, availTTLFloor, "极短间隔同样被 6h 下限压住"},
+		{1 * time.Hour, availTTLFloor, "3×间隔=3h 仍低于下限"},
+		{3 * time.Hour, 9 * time.Hour, "超过下限后按 3 倍间隔（容忍连丢两轮）"},
 		{12 * time.Hour, availTTLManual, "钳上限：不超过手动模式 24h"},
 	}
 	for _, c := range cases {
@@ -80,4 +86,24 @@ func TestAvailTTLFollowsInterval(t *testing.T) {
 			t.Errorf("interval=%s: availTTL()=%s，期望 %s（%s）", c.interval, got, c.want, c.why)
 		}
 	}
+}
+
+// 全量重探的日均请求数必须留在「不显眼」的量级。
+//
+// 这条不是形式主义：间隔与 TTL 都是可配的，一次配置改动就可能把探测变成
+// 对单个账号的密集轮询。用默认配置把上限钉住，改动时会被立刻拦下。
+func TestAvailProbeDailyRequestBudget(t *testing.T) {
+	const globalModels = 35 // 实测当前国际版目录规模
+	const budget = 200      // 约定上限：日均探测 chat 请求数
+
+	var p Panel
+	p.availInterval.Store(int64(30 * time.Minute)) // 默认间隔
+	ttl := p.availTTL()
+	perDay := float64(globalModels) * (float64(24*time.Hour) / float64(ttl))
+	if perDay > budget {
+		t.Fatalf("默认配置下日均探测请求 %.0f 次，超过上限 %d（TTL=%s）——"+
+			"探测会变成对单个 global 号的密集轮询", perDay, budget, ttl)
+	}
+	t.Logf("默认配置：TTL=%s，全量重探每 %.1fh，日均约 %.0f 请求（上限 %d）",
+		ttl, ttl.Hours(), perDay, budget)
 }

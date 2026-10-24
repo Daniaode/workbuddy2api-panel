@@ -45,22 +45,36 @@ import (
 //	目录的变更周期，不至于把一周前的结论当成现状。
 const availTTLManual = 24 * time.Hour
 
+// availTTLFloor 自动探测模式下结论的最短保留时长。
+//
+// 为什么不直接取 interval 的倍数：TTL 决定的是**全量重探的频率**，而重探
+// 一轮 = 35 个 chat 请求。按 interval×3 算，30m 间隔得到 90m 的 TTL，
+// 等于每小时把 35 个模型全部重探一遍——实测折算 560 请求/天，全部压在池里
+// 那一两个 global 号上。省积分不等于不冒险：单号每天 560 个 max_tokens=1
+// 的请求，这个密度本身就是异常信号。
+//
+// 6h 的来历：模型上下架、权限调整都不是小时级事件，半天刷新一次足够；
+// 折算 140 请求/天（约 5.8 个/小时），与正常对话流量同一个量级，不显眼。
+const availTTLFloor = 6 * time.Hour
+
 // availTTL 探测结果的实际保留时长。
 //
 //	自动探测开启时不能再用固定 24h：间隔 30m 意味着每半小时就有新证据，若仍按
 //	24h 保留，一次探测静默失败后面板会把一天前的结论当成现状——这比显示「待验证」
 //	更糟，因为「待验证」至少是诚实的。
 //
-//	取 interval 的 3 倍（容忍连丢两轮），钳在 [15m, 24h]：间隔很短时不至于让
-//	证据在两轮之间凭空过期；间隔很长时不超过手动模式的 24h 上限。
+//	取 max(interval×3, 6h) 再钳 24h：
+//	  · interval×3 是为了容忍连丢两轮而不让证据凭空过期；
+//	  · 6h 下限压住全量重探的频率（见 availTTLFloor 的成本说明）；
+//	  · 24h 上限与手动模式一致，间隔很长时不超过一天。
 func (p *Panel) availTTL() time.Duration {
 	iv := time.Duration(p.availInterval.Load())
 	if iv <= 0 {
 		return availTTLManual
 	}
 	ttl := iv * 3
-	if ttl < 15*time.Minute {
-		ttl = 15 * time.Minute
+	if ttl < availTTLFloor {
+		ttl = availTTLFloor
 	}
 	if ttl > availTTLManual {
 		ttl = availTTLManual
