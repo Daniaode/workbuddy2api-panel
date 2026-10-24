@@ -694,6 +694,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 粘性解绑、二次选号、倍率重算都只关心「本次允许跨域」。
 	crossRealm := crossFallback || balanced
 
+	// catalogPinned 表示「本次路由由模型目录钉死到某一域」——即 crossRealm 开着、
+	// 但该模型只在其中一域的目录里存在。
+	//
+	// 这种情形必须禁止跨域重试：目录说 global 没有这个模型，重试到 global 只会
+	// 拿到 11102/11158 再被判成 model_unavailable，把「池里没号」（503 可重试）
+	// 误报成「模型不存在」（400 不可重试）。实测复现：仅 cn 有的模型在国内号
+	// 暂停后返回 400 model_unavailable，正确应为 503 no_healthy_account。
+	catalogPinned := balanced && realm != ""
+
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
@@ -933,7 +942,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
 			pickRealm := realm
-			if crossRealm && h.cfg.Pool.ServableForModelRealm(bareModel, realm) == 0 &&
+			if crossRealm && !catalogPinned && h.cfg.Pool.ServableForModelRealm(bareModel, realm) == 0 &&
 				h.cfg.Pool.ServableForModelRealm(bareModel, otherRealm(realm)) > 0 {
 				// 首选域此刻没有真正可服务的号（11102 模型级负缓存 / 账号级冷却 /
 				// 在途占满），而另一域有 → 直接换域选号（issue #135）。先看健康度再选，
@@ -941,7 +950,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				pickRealm = otherRealm(realm)
 			}
 			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, pickRealm)
-			if acct == nil && crossRealm {
+			if acct == nil && crossRealm && !catalogPinned {
 				// 该域选不到（并发抢名额/轮换耗尽/另一域刚冷却完）→ 另一域再试一次，
 				// 保持尽力而为语义；tried 已记录失败号，轮转仍由 MaxRotate 封顶。
 				acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, otherRealm(pickRealm))
