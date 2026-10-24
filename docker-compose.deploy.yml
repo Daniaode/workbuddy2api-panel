@@ -1,0 +1,40 @@
+# 本机部署用 compose 文件（由 scripts/swap.sh 调用）
+#
+# 为什么不复用 docker-compose.yml：那个是「从源码构建」的开发用文件（build: .），
+# 而 swap 要用的是一个已经构建好、打完 tag 的镜像。两者用途不同，混在一起会让
+# 「这次到底构建了没有」变得含糊。
+#
+# 镜像由环境变量 WB2API_IMAGE 传入，swap.sh 会设为具体 tag（:next 或 rollback-*）。
+# 手工唤起（例如只想起某个回滚镜像看状态）：
+#   WB2API_IMAGE=workbuddy2api-panel-wb2api:rollback-20261024-1115 \
+#     docker-compose -f docker-compose.deploy.yml up -d
+#
+# 项目名默认取目录名 workbuddy2api-panel，与主 compose 文件一致，因此
+# `docker-compose ps` 能看到这里起的容器（按 project+service 标签匹配）。
+
+services:
+  wb2api:
+    image: ${WB2API_IMAGE:-workbuddy2api-panel-wb2api:latest}
+    # 镜像全是本机构建的本地 tag（:next / rollback-*），registry 上没有这些 tag。
+    # compose 默认会先尝试 pull，本地 tag 会被当成「不存在」而报错或拉取失败。
+    # 设为 never 表示只用本地已有镜像——也正是 swap 的语义：镜像已经构建好了。
+    pull_policy: never
+    container_name: workbuddy2api
+    restart: unless-stopped
+    # 容器内以 uid 10001 的 app 用户运行。挂载目录属主不一致会导致
+    # 「写入 auths/*.json.tmp 失败 permission denied」。三种解法：
+    #   1) 让容器用你的 uid 运行：PUID=$(id -u) PGID=$(id -g) docker-compose up -d
+    #   2) sudo chown -R 10001:10001 ./auths ./data ./config.json
+    #   3) user: "0:0" 以 root 运行（省事但逃逸面更大，自担）
+    user: "${PUID:-10001}:${PGID:-10001}"
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      - "7863:7863"
+    volumes:
+      # 相对路径以本文件所在目录（仓库根）为基准。
+      - ./auths:/app/auths
+      - ./data:/app/data
+      # config.json 必须先在宿主机存在（缺失时 Docker 会把挂载点建成目录，
+      # 容器启动失败）。不挂 :ro：面板「配置」页需要写回此文件（保存后热生效）。
+      - ./config.json:/app/config.json

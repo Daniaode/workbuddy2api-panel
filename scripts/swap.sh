@@ -15,6 +15,14 @@
 #   B. 回滚目标白名单：只接受 rollback-* 前缀，否则拒绝切换
 #   C. 结果文件判据：包装层读 data/swap-result.json，不信 shell 退出码
 #
+# 容器由 docker-compose 创建（不是裸 docker run）：
+#   - 配置文件 docker-compose.deploy.yml，镜像经 WB2API_IMAGE 传入
+#   - 好处：环境变量/挂载/用户映射只在 compose 文件里维护一份，不再和
+#     docker-compose.yml 各写一遍导致漂移；容器带完整 compose 标签，
+#     之后 `docker-compose ps/logs/down` 都能正常管它
+#   - 注意：compose 遇到同名但非 compose 管理的容器会报 name conflict，
+#     因此必须先 rm -f 再 up -d（下面的流程天然是这个顺序）
+#
 # 用法：
 #   bash scripts/swap.sh                  # 正式切换
 #   SWAP_TEST=1 bash scripts/swap.sh      # 试运行（安全，可随时在生产机跑）
@@ -25,6 +33,10 @@ LOG="$ROOT/data/swap.log"
 RESULT="$ROOT/data/swap-result.json"
 CONTAINER="workbuddy2api"
 REPO="workbuddy2api-panel-wb2api"
+# 部署用 compose 文件与项目名。项目名取仓库目录名，与主 compose 文件一致，
+# 这样 `docker-compose ps` 能同时看到构建版和部署版起的容器。
+COMPOSE_FILE="$ROOT/docker-compose.deploy.yml"
+COMPOSE_PROJECT="workbuddy2api-panel"
 
 NEW_IMAGE="${NEW_IMAGE:-$REPO:next}"
 
@@ -116,14 +128,15 @@ AUTH="Bear""er $KEY"
 
 # 容器启动参数集中一处：切换与回滚必须完全一致，否则回滚会带着不同的挂载/用户
 # 起来，出现「回滚后行为与切换前不一样」这种最难查的问题。
+#
+# 这份参数现在住在 docker-compose.deploy.yml 里，此处只负责把镜像名传进去：
+#   - user / ports / volumes / restart / TZ 全部由 compose 文件定义，单一事实源
+#   - pull_policy: never 保证 compose 只用本地已构建的镜像，不会去 registry 拉
+#     （:next 和 rollback-* 都是本地 tag，registry 上没有）
 start_container() {
     local image="$1"
-    run docker run -d --name "$CONTAINER" --restart unless-stopped \
-        --user 10001:10001 -e TZ=Asia/Shanghai -p 7863:7863 \
-        -v "$ROOT/auths:/app/auths" \
-        -v "$ROOT/data:/app/data" \
-        -v "$ROOT/config.json:/app/config.json" \
-        "$image"
+    run env WB2API_IMAGE="$image" \
+        docker-compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" up -d
 }
 
 fail() {
