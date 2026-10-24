@@ -309,7 +309,25 @@ func (p *Panel) StartAvailProbe(ctx context.Context, interval time.Duration) {
 			return
 		case <-time.After(30 * time.Second):
 		}
-		p.probeOnceLogged("startup")
+		// 首轮失败要重试，不能直接滑到下一个整间隔。
+		//
+		// 实测：容器重启后 30s 时池子往往还没把 global 号标为可用，
+		// 首轮必然报「池中没有可用的国际版账号」——按原实现这一轮就废了，
+		// 面板要再等 30 分钟才可能有结论。而重启恰恰发生在部署/排障之后，
+		// 正是最需要新鲜结论的时刻。
+		for attempt := 0; attempt < 5; attempt++ {
+			if attempt > 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Duration(attempt) * time.Minute):
+				}
+			}
+			yielded, err := p.probeOnceLogged("startup")
+			if yielded || err == nil {
+				break
+			}
+		}
 		var logged time.Duration
 		for {
 			cur := time.Duration(p.availInterval.Load())
@@ -329,22 +347,26 @@ func (p *Panel) StartAvailProbe(ctx context.Context, interval time.Duration) {
 	}()
 }
 
-// probeOnceLogged 跑一轮探测并按结果记日志。失败只记一行，不影响下一轮。
-func (p *Panel) probeOnceLogged(trigger string) {
+// probeOnceLogged 跑一轮探测并按结果记日志。
+//
+// 返回 (本轮是否让位给手动探测, 探测错误)。调用方据 err 决定是否值得重试：
+// 启动阶段池子还没热起来导致的失败是暂态的，等到下一个整间隔就白等半小时。
+func (p *Panel) probeOnceLogged(trigger string) (bool, error) {
 	if !availProbeMu.TryLock() {
-		return // 手动探测正在进行，本轮让位
+		return true, nil // 手动探测正在进行，本轮让位
 	}
 	defer availProbeMu.Unlock()
 	entries, err := p.runAvailProbe(false) // 自动：增量
 	if err != nil {
 		log.Printf("panel: 模型可用性自动探测（%s）跳过: %v", trigger, err)
-		return
+		return false, err
 	}
 	counts := map[string]int{}
 	for _, e := range entries {
 		counts[e.Level]++
 	}
 	log.Printf("panel: 模型可用性自动探测（%s）完成 %d 个模型 %v", trigger, len(entries), counts)
+	return false, nil
 }
 
 // SetAvailProbeInterval 热改探测间隔（下一轮生效；0 = 暂停）。
