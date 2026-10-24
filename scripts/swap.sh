@@ -50,9 +50,38 @@ die() {
 # 事故：测试时手工指定 OLD_IMAGE=$REPO:latest，恰好那个镜像是好的才没出事。
 # 若指向坏镜像，「服务正常」会变成「回滚到不可用」——比不切更糟。
 # 因此只接受 rollback-* 前缀，其余一律拒绝。
+# 回滚目标语义上应当是「切换前正在跑的那个镜像」。旧实现按 tag 名字符串排序
+# （sort | tail -1），rollback-2257 会排在 rollback-20261024-1115 之后被选中
+# ——但前者是更旧的镜像。tag 名里的数字跟时间无关（rollback-2257 是时分，
+# rollback-20261024-1115 是日期），按名字排序等于随机选。
+# 改成三档判定：
+#   1) 运行中镜像已有 rollback-* tag        → 直接用（最准）
+#   2) 运行中镜像没有 rollback tag          → 补建 rollback-<ts>（正式模式才写）
+#   3) 容器不存在（首次部署 / 已删）        → 退回按镜像创建时间取最新
+OLD_IMAGE_AUTOTAGGED=0
 if [[ -z "${OLD_IMAGE:-}" ]]; then
-    OLD_IMAGE=$(docker images --format '{{.Repository}}:{{.Tag}}' \
-        | grep -E "^${REPO}:rollback-" | sort | tail -1)
+    cur_img=$(docker inspect -f '{{.Image}}' "$CONTAINER" 2>/dev/null || true)
+    if [[ -n "$cur_img" ]]; then
+        cur_id="${cur_img#sha256:}"
+        OLD_IMAGE=$(docker images --format '{{.Repository}}:{{.Tag}}{{"\t"}}{{.ID}}' \
+            | grep -E "^${REPO}:rollback-" \
+            | awk -F'\t' -v id="$cur_id" 'substr(id,1,12)==$2 {print $1; exit}')
+        if [[ -z "$OLD_IMAGE" ]]; then
+            # 运行中镜像还没打 rollback tag：补一个，否则失败时无路可退。
+            # 注意 SWAP_TEST=1 下 run 只打印不执行，因此把「将补建」记在
+            # OLD_IMAGE_AUTOTAGGED 上，后面的 inspect 校验要放行。
+            cur_ts=$(date +%Y%m%d-%H%M)
+            OLD_IMAGE="${REPO}:rollback-${cur_ts}"
+            OLD_IMAGE_AUTOTAGGED=1
+            log "运行中镜像无 rollback tag，将补建 $OLD_IMAGE"
+            run docker tag "$cur_img" "$OLD_IMAGE"
+        fi
+    fi
+fi
+if [[ -z "${OLD_IMAGE:-}" ]]; then
+    # 容器不存在时兜底：按镜像创建时间取最新（ISO 时间串可直接字典序排序）。
+    OLD_IMAGE=$(docker images --format '{{.Repository}}:{{.Tag}}{{"\t"}}{{.CreatedAt}}' \
+        | grep -E "^${REPO}:rollback-" | sort -t$'\t' -k2 | tail -1 | cut -f1)
 fi
 if [[ -z "$OLD_IMAGE" ]]; then
     die "找不到 rollback-* 回滚镜像；宁可不动，也不要在没有退路时切换"
@@ -60,7 +89,7 @@ fi
 if [[ ! "$OLD_IMAGE" =~ ^${REPO}:rollback- ]]; then
     die "回滚目标 '$OLD_IMAGE' 不在白名单内（必须是 ${REPO}:rollback-*）"
 fi
-if ! docker image inspect "$OLD_IMAGE" >/dev/null 2>&1; then
+if [[ "$OLD_IMAGE_AUTOTAGGED" != "1" ]] && ! docker image inspect "$OLD_IMAGE" >/dev/null 2>&1; then
     die "回滚镜像 '$OLD_IMAGE' 在本机不存在"
 fi
 if ! docker image inspect "$NEW_IMAGE" >/dev/null 2>&1; then
