@@ -294,3 +294,29 @@ func jsonNumber(v float64) string {
 	}
 	return string(b[i:])
 }
+
+// clearModelLocks POST /panel/api/models/clear_locks —— 清除确定性模型锁。
+//
+// 参数 realm 可选（cn / global），空 = 两个域都清。
+//
+// 只清 11102（上游无此模型）与 11158（账号类型无权）：这两类是确定性拒绝，
+// 到期重试必然再次被拒并重新上锁，等待毫无意义。6004 限流锁保持不动——它是
+// 真的会恢复，清掉只会让下一个请求立刻再撞限流。
+func (p *Panel) clearModelLocks(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Pool == nil {
+		writeErr(w, http.StatusNotImplemented, "pool not available")
+		return
+	}
+	var body struct {
+		Realm string `json:"realm"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	realm := strings.TrimSpace(body.Realm)
+	if realm != "" && realm != "cn" && realm != "global" {
+		writeErr(w, http.StatusBadRequest, "realm 只能是 cn / global，或留空表示全部")
+		return
+	}
+	n := p.cfg.Pool.ClearDeterministicLocks(realm)
+	log.Printf("panel: 清除确定性模型锁 realm=%q 共 %d 条", realm, n)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": n})
+}

@@ -196,6 +196,9 @@ func (p *Panel) routes() {
 	// 模型很少进这两个窗口，于是长期显示「待验证」。探测把结论落盘 24h。
 	p.mux.HandleFunc("GET /panel/api/models/avail", p.withAuth(p.modelsAvail))
 	p.mux.HandleFunc("POST /panel/api/models/probe", p.withAuth(p.modelsProbe))
+	// 清除「确定性拒绝」的模型锁（11102/11158）。这两类锁等到期也不会恢复，
+	// 只是让面板长期显示一片「整池不可用」；6004 限流锁不受影响。
+	p.mux.HandleFunc("POST /panel/api/models/clear_locks", p.withAuth(p.clearModelLocks))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 	p.mux.HandleFunc("GET /panel/api/compensation", p.withAuth(p.compensation))

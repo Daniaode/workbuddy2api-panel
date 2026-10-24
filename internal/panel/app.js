@@ -530,23 +530,40 @@ function renderModelLocks(rows) {
     const ms = parseAPITime(iso);
     return ms ? dur(Math.max(0, Math.round((ms - Date.now()) / 1000))) : '—';
   };
+  // 确定性拒绝（11102/11158）的倒计时是误导：到期后会再次撞同一堵墙并重新上锁。
+  // 这类锁应当显示「不会自动恢复」，并提示用「清除确定性锁」去掉。
+  const DETERMINISTIC = /^(11102|11158)/;
   tb.innerHTML = rows.map(r => {
     const st = STATE[r.state] || ['mute', r.state || '—'];
     const realm = r.realm === 'global' ? '国际版' : '国内版';
+    const det = r.kind === 'deterministic' || DETERMINISTIC.test(String(r.reason || ''));
+    const unlockCell = det
+      ? '<span class="tag bad" title="上游确定性拒绝：到期重试必然再次被拒并重新上锁">不会自动恢复</span>'
+      : left(r.fully_unlock_at);
+    const firstCell = det ? '—' : left(r.unlock_at || r.fully_unlock_at);
     return '<tr>' +
       '<td>' + esc(r.model) + '</td>' +
       '<td><span class="realm-tag">' + realm + '</span></td>' +
       '<td><span class="tag ' + st[0] + '">' + st[1] + '</span></td>' +
       '<td class="num">' + (r.servable || 0) + ' / ' + (r.total || 0) + '</td>' +
       '<td class="num">' + (r.locked || 0) + '</td>' +
-      '<td class="num">' + left(r.unlock_at || r.fully_unlock_at) + '</td>' +
-      '<td class="num">' + left(r.fully_unlock_at) + '</td>' +
+      '<td class="num">' + firstCell + '</td>' +
+      '<td class="num">' + unlockCell + '</td>' +
       '<td>' + (r.reason ? '<div class="note">' + esc(r.reason) + '</div>' : '—') + '</td>' +
       '</tr>';
   }).join('');
   if (note) {
     const bad = rows.filter(r => r.state === 'locked' || r.state === 'starved').length;
-    note.textContent = bad ? bad + ' 个模型整池不可用' : rows.length + ' 个模型部分限流';
+    const det = rows.filter(r => r.kind === 'deterministic' || DETERMINISTIC.test(String(r.reason || ''))).length;
+    let txt = bad ? bad + ' 个模型整池不可用' : rows.length + ' 个模型部分限流';
+    if (det) txt += '（其中 ' + det + ' 个是上游确定性拒绝，等下去不会恢复）';
+    note.textContent = txt;
+  }
+  // 清除按钮只在存在确定性锁时才有意义
+  if ($('btnClearLocks')) {
+    const detRows = rows.filter(r => r.kind === 'deterministic' || DETERMINISTIC.test(String(r.reason || '')));
+    $('btnClearLocks').hidden = detRows.length === 0;
+    $('btnClearLocks').textContent = '清除确定性锁（' + detRows.length + '）';
   }
 }
 
@@ -951,6 +968,32 @@ if ($('btnAvail')) $('btnAvail').onclick = async () => {
   } finally {
     b.disabled = false;
     b.textContent = old;
+    loadModels();
+  }
+};
+
+// btnClearLocks 清除「确定性拒绝」的模型锁（11102 上游无此模型 / 11158 账号类型无权）。
+//
+// 为什么要这个按钮：这两类锁是上游的确定性答复，等到期也不会恢复——到期重试只会
+// 再撞一次同样的拒绝并重新上锁（6h→12h→24h 指数退避）。放着不清，面板会长期挂着
+// 十几行「整池不可用」，让人以为池子坏了。
+//
+// 只清确定性锁；6004 限流冷却不动——那是真的会恢复，清掉只会让下一个请求立刻撞限流。
+if ($('btnClearLocks')) $('btnClearLocks').onclick = async () => {
+  const b = $('btnClearLocks');
+  if (!confirm('清除全部「上游确定性拒绝」的模型锁？\n\n这些模型（11102 无此模型 / 11158 账号无权）即使到期也不会自动恢复。\n清除后它们会重新参与选号，若上游仍然拒绝会立刻重新上锁。\n\n6004 限流冷却不受影响。')) return;
+  const old = b.textContent;
+  b.disabled = true;
+  b.textContent = '清除中…';
+  try {
+    const r = await api('models/clear_locks', { method: 'POST', body: JSON.stringify({}) });
+    toast('已清除 ' + (r.cleared || 0) + ' 条确定性模型锁', 'ok');
+  } catch (e) {
+    toast('清除失败：' + e.message, 'err');
+  } finally {
+    b.disabled = false;
+    b.textContent = old;
+    loadOverview(true);
     loadModels();
   }
 };
