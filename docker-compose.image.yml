@@ -1,0 +1,43 @@
+# 面向使用者的纯镜像部署（免克隆、免构建）
+#
+# 与 docker-compose.yml 的区别：那份是给二次开发用的（build: .），
+# 这份直接拉 GHCR 上已发布的镜像，不需要 clone 仓库、不需要本地 Go 环境。
+#
+# 用法：
+#   mkdir -p workbuddy2api && cd workbuddy2api
+#   curl -fsSLO https://raw.githubusercontent.com/Daniaode/workbuddy2api-panel/main/docker-compose.image.yml
+#   curl -fsSLO https://raw.githubusercontent.com/Daniaode/workbuddy2api-panel/main/config.example.json
+#   mv docker-compose.image.yml docker-compose.yml
+#   mv config.example.json config.json
+#   mkdir -p auths data
+#   docker compose up -d
+#
+# 更新到最新版：
+#   docker compose pull && docker compose up -d
+#
+# 锁定某个版本（可选，把 latest 换成 commit 短 sha）：
+#   image: ghcr.io/daniaode/workbuddy2api-panel:sha-fecc459
+
+services:
+  wb2api:
+    image: ghcr.io/daniaode/workbuddy2api-panel:latest
+    container_name: workbuddy2api
+    restart: unless-stopped
+    # 容器内以 uid 10001 的 app 用户运行。挂载目录属主不一致会导致
+    # 「写入 auths/*.json.tmp 失败 permission denied」。三种解法：
+    #   1) 让容器用你的 uid 运行：PUID=$(id -u) PGID=$(id -g) docker compose up -d
+    #   2) sudo chown -R 10001:10001 ./auths ./data ./config.json
+    #   3) user: "0:0" 以 root 运行（省事但逃逸面更大，自担）
+    user: "${PUID:-10001}:${PGID:-10001}"
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      - "7863:7863"
+    volumes:
+      - ./auths:/app/auths
+      - ./data:/app/data
+      # config.json 必须先在宿主机存在（缺失时 Docker 会把挂载点建成目录，
+      # 容器启动失败）。程序本身能在缺失时自动生成配置，但那要求它能以文件
+      # 形式写入——目录挂载会挡住这条路径。
+      # 不挂 :ro：面板「配置」页需要写回此文件（保存后热生效）。
+      - ./config.json:/app/config.json

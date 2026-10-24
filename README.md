@@ -537,8 +537,52 @@ curl -s http://localhost:7863/healthz
 >
 > 镜像 tag 规则：`main` 分支推送 `latest` / `main` / `sha-xxxxxx`；打 `v*` tag 额外发布
 > `1.2.3` / `1.2` / `1` 语义化版本；PR 仅构建验证、不推送。
+>
+> `latest` 只跟随**已验证发布**的提交，可放心用于生产；需要固定版本时改用
+> `sha-xxxxxx` 或语义化版本 tag。
 
-### 方式一：Docker Compose（推荐服务器部署）
+#### 用 compose 跑镜像（推荐，便于日后更新）
+
+`docker run` 写起来简单，但更新时要手工 stop/rm/run 并重新敲一遍全部参数，容易漏。
+仓库提供了纯镜像版 compose 文件，一次准备、之后一条命令更新：
+
+```bash
+# 1. 建目录并取两个文件（不需要 clone 整个仓库）
+mkdir -p workbuddy2api && cd workbuddy2api
+curl -fsSLO https://raw.githubusercontent.com/Daniaode/workbuddy2api-panel/main/docker-compose.image.yml
+curl -fsSLO https://raw.githubusercontent.com/Daniaode/workbuddy2api-panel/main/config.example.json
+mv docker-compose.image.yml docker-compose.yml
+mv config.example.json config.json
+mkdir -p auths data
+
+# 2. 首次启动
+docker compose up -d
+
+# 3. 健康检查（无可用账号时返回 503）
+curl -s http://localhost:7863/healthz
+```
+
+#### 更新到最新版
+
+```bash
+docker compose pull      # 拉最新镜像
+docker compose up -d     # 镜像有变化才重建容器；无变化不动
+```
+
+`up -d` 会比对镜像 digest：没新版本时容器不会被重启，可以放心定时执行。
+配置与账号数据在宿主机的 `config.json`、`auths/`、`data/`，重建容器不丢。
+
+想完全自动化，可加一条 cron（每天凌晨检查一次）：
+
+```bash
+0 4 * * * cd /path/to/workbuddy2api && docker compose pull -q && docker compose up -d
+```
+
+> 若用的是 `docker run` 而非 compose，更新需手工三步：
+> `docker pull <image>` → `docker stop workbuddy2api && docker rm workbuddy2api` →
+> 重新执行原来的 `docker run` 命令（参数保持不变，卷挂载不变则数据不丢）。
+
+### 方式一：Docker Compose（从源码构建，二次开发用）
 
 ```bash
 # 1. 克隆
