@@ -808,6 +808,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="grow"></span>
           <span class="note" id="mdNote">实时查询上游</span>
           <button class="xs" id="btnModels">重新获取</button>
+          <!-- 「探测可用性」只探 global 前缀模型：最小请求（max_tokens=1），实测免费模型
+               credit=0、被拒模型不计费。国际版模型很少进入「最近 100 条请求」窗口，
+               没有这一步它们会长期显示「待验证」。结果落盘 24h。 -->
+          <button class="xs" id="btnAvail" title="对每个国际版模型发一次最小请求，把「当前账号能不能用」落成持久证据">探测可用性</button>
         </header>
         <div class="fbar" id="mdFilter">
           <input id="mdQ" type="search" placeholder="搜索模型 ID / 名称 / 描述 / 厂商" aria-label="搜索模型">

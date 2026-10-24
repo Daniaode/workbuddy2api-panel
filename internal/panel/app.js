@@ -12,7 +12,7 @@ let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
 let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
-let mdLocks = [], mdRecent = [];
+let mdLocks = [], mdRecent = [], mdAvail = {};
 let reqFilter = { q: '', outcome: '' };
 let reqEntries = [];
 let usDim = 'account', usCreditDim = 'account', usSort = 'total';
@@ -702,16 +702,19 @@ async function loadModels() {
   try {
     // 探测、模型锁与最近请求都是本地可选增强：任一失败不影响模型目录本身。
     // 可用性标签不额外发推理请求，只用模型锁和最近真实请求结果合成。
-    const [d, pr, st, rm] = await Promise.all([
+    const [d, pr, st, rm, av] = await Promise.all([
       api('models'),
       api('model_probes').catch(() => ({})),
       api('status').catch(() => ({})),
       api('request_metrics').catch(() => ({})),
+      api('models/avail').catch(() => ({})),
     ]);
     mdAll = d.models || [];
     mdProbes = pr.probes || {};
     mdLocks = Array.isArray(st.model_locks) ? st.model_locks : [];
     mdRecent = Array.isArray(rm.recent) ? rm.recent : [];
+    mdAvail = {};
+    for (const e of (av.entries || [])) if (e && e.model) mdAvail[e.model] = e;
     if (!mdAll.length) {
       tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>';
       $('mdCount').textContent = '';
@@ -820,6 +823,31 @@ function mdAvailabilityOf(m, locks, recent) {
     return { key: 'limited', label: '限流/不可用', cls: 'warn',
       tip: '模型级冷却中' + (reason ? '；' + reason : '') };
   }
+  // 持久探测证据（models/probe 落盘 24h）：比「最近 100 条请求」更可靠——
+  // 国际版模型很少进入那个滚动窗口，只看它会让三十多个模型长期显示「待验证」。
+  const av = mdAvail[id];
+  if (av) {
+    const when = av.checked_at ? new Date(av.checked_at).toLocaleString('zh-CN', { hour12: false }) : '';
+    if (av.level === 'ok') {
+      return { key: 'ok', label: '可用', cls: 'ok',
+        tip: '主动探测成功' + (when ? ' · ' + when : '') };
+    }
+    if (av.level === 'denied') {
+      return { key: 'denied', label: '无权限', cls: 'bad',
+        tip: '当前国际版账号类型不支持该模型' + (av.message ? '；' + av.message : '') + (when ? ' · ' + when : '') };
+    }
+    if (av.level === 'missing') {
+      return { key: 'missing', label: '上游无此模型', cls: 'bad',
+        tip: '上游目录残留，实际请求返回模型不存在' + (when ? ' · ' + when : '') };
+    }
+    if (av.level === 'limited') {
+      return { key: 'rate', label: '限流', cls: 'warn',
+        tip: '探测时被限流' + (when ? ' · ' + when : '') };
+    }
+    return { key: 'failed', label: '探测失败', cls: 'warn',
+      tip: '探测未成功' + (av.message ? '；' + av.message : '') + (when ? ' · ' + when : '') };
+  }
+
   const ev = recent.find(e => e && e.model === id);
   if (ev) {
     const status = Number(ev.status || 0);
@@ -906,6 +934,26 @@ for (const [id, key] of [['mdRealm', 'realm'], ['mdCap', 'cap'], ['mdEffort', 'e
 }
 $('mdReset').onclick = resetModelFilter;
 $('btnModels').onclick = loadModels;
+
+// btnAvail 主动探测国际版模型可用性（同步，约 15–25 秒）。
+// 只在需要时点：每个模型一次最小请求，实测免费模型 credit=0、被拒模型不计费，
+// 但仍是真实上游请求，不该被当成「刷新」随便按。
+if ($('btnAvail')) $('btnAvail').onclick = async () => {
+  const b = $('btnAvail');
+  const old = b.textContent;
+  b.disabled = true;
+  b.textContent = '探测中…';
+  try {
+    const r = await api('models/probe', { method: 'POST' });
+    toast('已探测 ' + (r.checked || 0) + ' 个国际版模型', 'ok');
+  } catch (e) {
+    toast('探测失败：' + e.message, 'err');
+  } finally {
+    b.disabled = false;
+    b.textContent = old;
+    loadModels();
+  }
+};
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
 let logCh = 'all';

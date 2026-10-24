@@ -191,6 +191,11 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
+	// 模型可用性实证：GET 读缓存结论，POST 主动探测一轮（只探 global 前缀）。
+	// 存在的理由：面板原本只有「模型锁」与「最近 100 条请求」两类证据，国际版
+	// 模型很少进这两个窗口，于是长期显示「待验证」。探测把结论落盘 24h。
+	p.mux.HandleFunc("GET /panel/api/models/avail", p.withAuth(p.modelsAvail))
+	p.mux.HandleFunc("POST /panel/api/models/probe", p.withAuth(p.modelsProbe))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 	p.mux.HandleFunc("GET /panel/api/compensation", p.withAuth(p.compensation))
