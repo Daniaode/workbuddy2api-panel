@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -94,6 +95,10 @@ type Panel struct {
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
+
+	// availInterval 模型可用性自动探测间隔（纳秒，atomic）。
+	// 0 = 暂停；运行期由 SetAvailProbeInterval 热改，下一轮生效。
+	availInterval atomic.Int64
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。

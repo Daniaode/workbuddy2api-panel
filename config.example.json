@@ -8,7 +8,8 @@
     "read_timeout": "300s"
   },
   "panel": {
-    "package_detail_limit": 5
+    "package_detail_limit": 5,
+    "avail_probe_interval": "30m"
   },
   "logging": {
     "request_archive_enabled": true,

@@ -29,6 +29,19 @@ type Config struct {
 	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
 		PackageDetailLimit int `json:"package_detail_limit"`
+
+		// AvailProbeInterval 模型可用性自动探测间隔（duration 串，如 "1h"）。
+		//
+		// 为什么需要这个配置：探测此前只能手动点按钮，面板的「待验证」是静默的——
+		// 没人点，三十多个国际版模型就永远显示灰字。用户感知成「探测间隔太长」，
+		// 实际是「根本没有自动探测」。
+		//
+		// 成本：每模型一次 max_tokens=1 的最小请求，实测 credit=0（免费模型），
+		// 被拒模型（11102/11158）不计费。35 个 global 模型一轮的积分消耗为 0，
+		// 因此可以把间隔压得比探活（L1 15m）还短而不烧额度。
+		//
+		// 特殊值："" 或 "0" = 关闭自动探测（只保留手动按钮）。
+		AvailProbeInterval string `json:"avail_probe_interval"`
 	} `json:"panel"`
 
 	Logging struct {
@@ -280,6 +293,9 @@ type Config struct {
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
+
+	// AvailProbeIntervalDur 解析后的模型可用性自动探测间隔；0 = 关闭自动探测。
+	AvailProbeIntervalDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -294,6 +310,7 @@ func Default() *Config {
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.ReadTimeout = "300s"
 	c.Panel.PackageDetailLimit = 5
+	c.Panel.AvailProbeInterval = "30m"
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
 	c.Logging.RequestArchiveMaxMB = 100
@@ -583,6 +600,18 @@ func (c *Config) normalize() error {
 	}
 	if c.CostExploreIntervalDur < 0 {
 		c.CostExploreIntervalDur = 0
+	}
+	// 模型可用性自动探测间隔：空值回落默认 30m；"0" 合法（关闭自动探测，
+	// 只保留面板手动按钮）；负值钳 0（无"负间隔"语义）。
+	if c.Panel.AvailProbeInterval == "" {
+		c.Panel.AvailProbeInterval = "30m"
+	}
+	if c.AvailProbeIntervalDur, err = time.ParseDuration(c.Panel.AvailProbeInterval); err != nil {
+		return fmt.Errorf("panel.avail_probe_interval: %w", err)
+	}
+	if c.AvailProbeIntervalDur < 0 {
+		c.AvailProbeIntervalDur = 0
+		c.Panel.AvailProbeInterval = "0"
 	}
 	// 积分保底：负值钳 0（= 关闭）。0 是合法默认（关闭），无需空值回落。
 	if c.Pool.CreditFloor < 0 {

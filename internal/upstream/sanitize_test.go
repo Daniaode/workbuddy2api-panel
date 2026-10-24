@@ -19,6 +19,9 @@ const (
 	codexInstructions = "You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI. You are expected to be precise, safe, and helpful."
 )
 
+// dshNeutral DSH 身份句被改写后的中性句。
+const dshNeutral = "You are a helpful AI assistant."
+
 func TestIdentityRewritten(t *testing.T) {
 	out := sanitizeText(ccIdentity)
 	if !strings.Contains(out, "official CLI tool for Claude.") {
@@ -160,6 +163,68 @@ func TestTrailingKVStripped(t *testing.T) {
 	out := sanitizeText("...; cc_version=2.0; cc_entrypoint=cli;")
 	if strings.Contains(out, "cc_version") || strings.Contains(out, "cc_entrypoint") {
 		t.Errorf("trailing kv not stripped: %q", out)
+	}
+}
+
+// DSH（DeepSeek Harness）身份句消毒回归测试。
+//
+// 背景：最初只实现了「动词锚定」一条正则（要求出现 powered by / built on 等），
+// 而最典型的身份句 "You are DeepSeek Harness." 根本没有动词——实测 changed=false，
+// 品牌串原样发往上游，这类漏网会导致 400 / 11‑128。同时预检 hasFingerprint 用的是
+// 区分大小写的 strings.Contains，全小写形态连正则都进不去。两者一并修复后锁定行为。
+func TestDshIdentityRewritten(t *testing.T) {
+	cases := []string{
+		"You are DeepSeek Harness.",
+		"you are deepseek harness.",
+		"YOU ARE DEEPSEEK HARNESS.",
+		"You are DeepSeek Harness, built on DeepSeek.",
+		"You are a helpful DeepSeek Harness.",
+		"I am DeepSeek Harness.",
+		"This assistant is powered by DeepSeek Harness.",
+		"You are DSH.",
+	}
+	for _, in := range cases {
+		out := sanitizeText(in)
+		if out == in {
+			t.Errorf("DSH 身份句未被净化: %q", in)
+			continue
+		}
+		if strings.Contains(strings.ToLower(out), "deepseek harness") {
+			t.Errorf("品牌串残留: %q -> %q", in, out)
+		}
+		if out != dshNeutral {
+			t.Errorf("替换结果应为中性身份句: %q -> %q", in, out)
+		}
+	}
+}
+
+// 非身份句不得误伤：动词式正则的主语必须带 "You are / I am / This X is"，
+// 分词修饰宾语（用户数据）不在其列。
+func TestDshNonIdentityUntouched(t *testing.T) {
+	cases := []string{
+		"You are free to use tools built by third parties.",
+		"Files created by the build step are ignored.",
+		"The DSH command failed.",
+		"please use main branch for this repo",
+		"ordinary user message",
+		"You are a helpful AI assistant.",
+	}
+	for _, in := range cases {
+		if out := sanitizeText(in); out != in {
+			t.Errorf("非身份句被误改: %q -> %q", in, out)
+		}
+	}
+}
+
+// 预检必须与上游同口径（大小写不敏感），否则 (?i) 正则永远跑不到。
+func TestDshFeatureDetectedCaseInsensitive(t *testing.T) {
+	for _, in := range []string{
+		"you are deepseek harness.",
+		"YOU ARE DEEPSEEK HARNESS.",
+	} {
+		if !hasFingerprint(in) {
+			t.Errorf("预检漏判（大小写不敏感应命中）: %q", in)
+		}
 	}
 }
 

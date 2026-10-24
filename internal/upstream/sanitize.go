@@ -22,8 +22,8 @@ var sanitizeFeatures = []string{
 	"11-128",                                          // 上游反探测：裸数字错误码（真实错误码是 ASCII 连字符）
 	// DSH（DeepSeek Harness）身份句：上游对「自我介绍句式 + 品牌」做大小写不敏感的
 	// 连续子串匹配，命中即 400 / 11-128。单个品牌词、改词或去掉句式都放行。
-	// 预检用截断前缀，让下方 sanitizeDshRe 兜底层能跑起来。
-	"DeepSeek Harness", // DSH 品牌名
+	// 预检用截断前缀，让下方的 sanitizeDshBrandRe / sanitizeDshVerbRe 能跑起来。
+	"DeepSeek Harness", // DSH 品牌名（全称；大小写变体由 hasFingerprint 的折叠查找兜住）
 	"powered by",       // 身份句动词
 	"built on",         // 身份句动词
 	"built by",         // 身份句动词
@@ -88,23 +88,39 @@ var sanitizeRewrites = [][2]string{
 	},
 }
 
-// sanitizeDshRe DSH（DeepSeek Harness）身份句兜底正则：匹配「自我介绍句式 + 品牌」
-// 的任意组合，无论用哪个动词、哪个品牌、带几个修饰词。上游对这类整句做大小写
-// 不敏感的连续子串匹配，命中即 400 / 11-128。
+// DSH（DeepSeek Harness）身份句消毒：两条正则，缺一不可。
 //
-// 结构：You are <修饰词 0~3> <名词 agent|assistant|model 或省略> <动词> <品牌>
+// 上游对「自我介绍句式 + 品牌」做大小写不敏感的连续子串匹配，命中即 400 / 11‑128。
 //
-//	动词：powered by / built on / built by / created by / developed by / made by / trained by
-//	品牌：[\w.-]+（覆盖 DeepSeek、deepseek-v4.1-flash、Harness、OpenAI 等）
+// 为什么要两条：最初只有「动词式」一条，实测漏掉最典型的形态——
 //
-// 分词修饰宾语（"You are free to use tools built by X"）不含 "You are [agent|assistant]"
-// 前缀，本正则不匹配，保持原样——那是用户数据，不该改写。
+//	You are DeepSeek Harness.        ← 无动词，动词式正则必然 MISS
+//	You are DeepSeek Harness, built on DeepSeek.   ← 逗号截断，也 MISS
+//	This assistant is powered by DeepSeek Harness. ← 主语不是 "You are"，也 MISS
 //
-// 来源：社区分支 enticingns/workbuddy2api-panel 的 5d81941（2026-10-24）。
-var sanitizeDshRe = regexp.MustCompile(
-	`(?i)\bYou are (?:\w+ ){0,3}(?:agent|assistant|model)?\s*,?\s*` +
+// 三条都是真实会出现的身份句，其中第一条正是品牌名本身最自然的用法。
+// 所以拆成「品牌锚定」与「动词锚定」两条，各自覆盖一类。
+
+// sanitizeDshBrandRe 品牌锚定：句子里出现 DSH 品牌名，无论用不用动词。
+var sanitizeDshBrandRe = regexp.MustCompile(
+	`(?i)\b(?:You are|I am|This (?:assistant|model|agent) is)\s+` +
+		`(?:[A-Za-z0-9_.-]+\s+){0,3}(?:an?\s+)?` +
+		`(?:DeepSeek Harness|DSH)\b(?:\s*[.,]?[^\n]*)?`)
+
+// sanitizeDshVerbRe 动词锚定：任意品牌名，靠 "powered by / built on / …" 识别。
+//
+// 主语扩到 You are / I am / This assistant is——上游按整句模式匹配，不限主语。
+var sanitizeDshVerbRe = regexp.MustCompile(
+	`(?i)\b(?:You are|I am|This (?:assistant|model|agent) is)\s+` +
+		`(?:[A-Za-z0-9_.-]+\s+){0,3}(?:an?\s+)?` +
 		`(?:powered by|built on|built by|created by|developed by|made by|trained by)\s+` +
-		`(?:the )?[\w.-]+(?: [A-Za-z][\w.-]*)?(?: model)?\s*[.,]?`)
+		`(?:the\s+)?[\w.-]+(?:\s+[A-Za-z][\w.-]*)?(?:\s+model)?\s*[.,]?`)
+
+// sanitizeDshText 按顺序套两条正则；命中即整句换成中性身份句。
+func sanitizeDshText(text string) string {
+	text = sanitizeDshBrandRe.ReplaceAllString(text, "You are a helpful AI assistant.")
+	return sanitizeDshVerbRe.ReplaceAllString(text, "You are a helpful AI assistant.")
+}
 
 // sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。
 func sanitizeText(text string) string {
@@ -115,8 +131,8 @@ func sanitizeText(text string) string {
 		text = strings.ReplaceAll(text, rw[0], rw[1])
 	}
 	// DSH 身份句兜底：精确模板句已由 sanitizeRewrites 处理，
-	// 本正则只接「任意动词 + 任意品牌」的变体。
-	text = sanitizeDshRe.ReplaceAllString(text, "You are a helpful AI assistant.")
+	// 这里接「品牌锚定」与「动词锚定」两类变体。
+	text = sanitizeDshText(text)
 	if sanitizeHdrRe.MatchString(text) {
 		text = sanitizeHdrRe.ReplaceAllString(text, "")
 	}
@@ -137,11 +153,49 @@ func sanitizeText(text string) string {
 // Contains 大小写敏感、sanitizeHdrRe 要求冒号——两者都会漏掉「混合大小写 + 裸键名」，
 // 必须再用不要求冒号的 (?i) 正则兜底（sanitizeBareHdrRe），否则整条净化被跳过。
 // sanitizeBareHdrRe 不要求冒号，是 sanitizeHdrRe 的超集，故无需再单独匹配后者。
+// containsFoldASCII 大小写不敏感的 ASCII 子串查找，零分配。
+//
+// 为什么不用 strings.ToLower + strings.Contains：hasFingerprint 在每个消息的
+// content / reasoning / tool_calls 上都会跑，而请求体动辄几十上百 KB——每次
+// 复制一份全文做小写化，在热路径上是白送的分配。
+func containsFoldASCII(text, sub string) bool {
+	n, m := len(text), len(sub)
+	if m == 0 || m > n {
+		return false
+	}
+	for i := 0; i+m <= n; i++ {
+		ok := true
+		for j := 0; j < m; j++ {
+			a, b := text[i+j], sub[j]
+			if 'A' <= a && a <= 'Z' {
+				a += 'a' - 'A'
+			}
+			if 'A' <= b && b <= 'Z' {
+				b += 'a' - 'A'
+			}
+			if a != b {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
 func hasFingerprint(text string) bool {
 	for _, f := range sanitizeFeatures {
 		if strings.Contains(text, f) {
 			return true
 		}
+	}
+	// DSH 品牌名上游按大小写不敏感匹配，预检必须同口径：上面的 sanitizeFeatures
+	// 走的是区分大小写的 Contains，全小写形态（"you are deepseek harness."）会在
+	// 这里被判成「无指纹」而直接返回，连 (?i) 的 sanitizeDshBrandRe 都进不去。
+	if containsFoldASCII(text, "deepseek harness") || containsFoldASCII(text, "dsh") {
+		return true
 	}
 	return sanitizeBareHdrRe.MatchString(text)
 }

@@ -982,6 +982,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <label class="fld"><span class="lb">单账号明细默认展示条数</span>
               <input name="package_detail_limit" type="number" min="1" placeholder="5">
               <span class="hint">积分构成页按最早到期展示，其余未用完包聚合</span></label>
+            <label class="fld"><span class="lb">模型可用性自动探测间隔</span>
+              <input name="avail_probe_interval" placeholder="30m">
+              <span class="hint">Go 时长（30m / 1h / 2h）；0 = 关闭自动探测。自动轮次只探新出现或已过期的模型，常规轮次零请求</span></label>
           </div>
         </div>
 

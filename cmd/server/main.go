@@ -296,7 +296,10 @@ func main() {
 	up.SetCreditObserver(creditHist.Observe)
 	log.Printf("[credithist] 积分历史已启用: %s", stateSibling(cfg.StateFile, "credit-history.json"))
 
-	pn := panel.New(panel.Config{
+	// 先声明再赋值：SaveConfig 闭包需要 panel 自身（下发探测间隔），
+	// 而它此时正在被构造——闭包在请求到来时才执行，那时 pn 已就绪。
+	var pn *panel.Panel
+	pn = panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
 		RequestLog:  requestLog,
@@ -316,7 +319,7 @@ func main() {
 			return Load(*cfgPath)
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
-			return saveConfig(raw, *cfgPath, live, p, up, sch)
+			return saveConfig(raw, *cfgPath, live, p, up, sch, pn)
 		},
 		// 积分历史账本（只读展示；写入由上面的余额观察者完成）。
 		CreditHistory: creditHist,
@@ -359,6 +362,9 @@ func main() {
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
+	// 模型可用性自动探测：此前只能手动点面板按钮，没人点就永远显示「待验证」。
+	// 0 = 关闭（只保留手动按钮）。
+	pn.StartAvailProbe(ctx, cfg.AvailProbeIntervalDur)
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
 	// 填充（两者均懒触发），重启后到首次 /v1/models 或面板模型页被访问之前，
@@ -462,7 +468,9 @@ func panelListenPath(listen string) string {
 // 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
-func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
+// panels 为可选的面板实例：面板自身的可热改参数（如模型可用性探测间隔）需要通过
+// 它下发。做成可变参数而不是必填，是为了不惊动既有调用点与测试。
+func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, panels ...*panel.Panel) ([]string, error) {
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
@@ -553,6 +561,12 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
+	// 模型可用性探测间隔：定时器每轮重读该值，改完下一轮生效（0 = 暂停）。
+	for _, pn := range panels {
+		if pn != nil {
+			pn.SetAvailProbeInterval(newCfg.AvailProbeIntervalDur)
+		}
+	}
 
 	return restartRequiredFields(newCfg), nil
 }

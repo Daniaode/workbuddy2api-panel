@@ -22,7 +22,9 @@
 package panel
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -36,11 +38,35 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
-// availTTL 探测结果的保留时长。
+// availTTLManual 手动模式下的探测结果保留时长。
 //
-//	取 24h：比模型锁的 6h 长，覆盖「一天看一次面板」的节奏；又短于上游模型目录
-//	的变更周期，不至于把一周前的结论当成现状。
-const availTTL = 24 * time.Hour
+//	自动探测关闭时（panel.avail_probe_interval = 0）只有人点按钮才更新证据，
+//	此时取 24h：比模型锁的 6h 长，覆盖「一天看一次面板」的节奏；又短于上游模型
+//	目录的变更周期，不至于把一周前的结论当成现状。
+const availTTLManual = 24 * time.Hour
+
+// availTTL 探测结果的实际保留时长。
+//
+//	自动探测开启时不能再用固定 24h：间隔 30m 意味着每半小时就有新证据，若仍按
+//	24h 保留，一次探测静默失败后面板会把一天前的结论当成现状——这比显示「待验证」
+//	更糟，因为「待验证」至少是诚实的。
+//
+//	取 interval 的 3 倍（容忍连丢两轮），钳在 [15m, 24h]：间隔很短时不至于让
+//	证据在两轮之间凭空过期；间隔很长时不超过手动模式的 24h 上限。
+func (p *Panel) availTTL() time.Duration {
+	iv := time.Duration(p.availInterval.Load())
+	if iv <= 0 {
+		return availTTLManual
+	}
+	ttl := iv * 3
+	if ttl < 15*time.Minute {
+		ttl = 15 * time.Minute
+	}
+	if ttl > availTTLManual {
+		ttl = availTTLManual
+	}
+	return ttl
+}
 
 // AvailEntry 单个模型的一次探测结论。
 type AvailEntry struct {
@@ -92,7 +118,7 @@ func (p *Panel) loadAvail(now time.Time) map[string]AvailEntry {
 		return out
 	}
 	for _, e := range f.Entries {
-		if e.Model == "" || now.Sub(e.CheckedAt) > availTTL {
+		if e.Model == "" || now.Sub(e.CheckedAt) > p.availTTL() {
 			continue
 		}
 		out[e.Model] = e
@@ -137,25 +163,31 @@ func (p *Panel) modelsAvail(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(list, func(i, j int) bool { return list[i].Model < list[j].Model })
 	writeJSON(w, http.StatusOK, map[string]any{
 		"entries": list,
-		"ttl_sec": int(availTTL.Seconds()),
+		"ttl_sec": int(p.availTTL().Seconds()),
 	})
 }
 
-// modelsProbe POST /panel/api/models/probe —— 主动探测全部 global 模型。
+// runAvailProbe 执行一轮探测并落盘，供手动端点与后台定时器共用。
 //
-// 同步执行：35 个模型约 15–25 秒。前端带「探测中」提示即可；改成异步 + 轮询
-// 会让面板多一套状态机，而这是低频手动操作，不值得。
-func (p *Panel) modelsProbe(w http.ResponseWriter, r *http.Request) {
+// manual=true 时全量探测（人点了按钮，就要一份完整现状）。
+// manual=false 时**增量**探测：只探「没有记录」或「记录已过期」的模型。
+//
+// 为什么自动探测必须增量，而不是每轮全量：
+//
+//	全量一轮 = 35 个 chat 请求。若每 30 分钟跑一次，一天就是 1680 个请求，
+//	而池里通常只有一两个 global 账号——单账号每天 800+ 个 max_tokens=1 的
+//	请求，这个密度本身就是异常信号。省积分不等于不冒险：不扣费不代表不触发风控。
+//
+//	增量之后，常规轮次的请求数是 0（所有模型都有新鲜记录），只有上游目录里
+//	**新出现**的模型才会被探测。这正是「待验证」消失后应有的行为。
+//
+// 返回 (entries, err)。err 只在「这轮没能完成探测」时返回：
+// 没有可用 global 号、上游模型目录为空。此时调用方应保持**原有**探测结果
+// 不动——用一次失败去清空已有的有效证据，比不探测更糟。
+func (p *Panel) runAvailProbe(manual bool) ([]AvailEntry, error) {
 	if p.cfg.Upstream == nil || p.cfg.Pool == nil {
-		writeErr(w, http.StatusNotImplemented, "upstream not available")
-		return
+		return nil, errNoUpstream
 	}
-	if !availProbeMu.TryLock() {
-		writeErr(w, http.StatusConflict, "探测正在进行中，请稍候")
-		return
-	}
-	defer availProbeMu.Unlock()
-
 	// 选一个可用的 global 账号：可用性判定本来就和账号类型强相关，
 	// 用池里第一个健康号即可代表「当前这个号能不能用」。
 	var acct *auth.Auth
@@ -166,8 +198,7 @@ func (p *Panel) modelsProbe(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if acct == nil {
-		writeErr(w, http.StatusServiceUnavailable, "池中没有可用的国际版账号，无法探测")
-		return
+		return nil, errNoGlobalAccount
 	}
 
 	// 只探 global 前缀的模型（见文件头注释的成本与边界说明）。
@@ -178,19 +209,78 @@ func (p *Panel) modelsProbe(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if len(models) == 0 {
-		writeErr(w, http.StatusBadGateway, "上游未返回国际版模型目录，无法探测")
+		return nil, errNoModelCatalog
+	}
+
+	// 增量模式：跳过已有新鲜记录的模型。
+	fresh := map[string]AvailEntry{}
+	if !manual {
+		fresh = p.loadAvail(time.Now())
+	}
+
+	// 保留其它模型的旧结论，只覆盖本轮探测的条目——否则增量会把没探的
+	// 全部丢掉，面板反而变回「待验证」。
+	merged := make(map[string]AvailEntry, len(models))
+	for k, v := range fresh {
+		merged[k] = v
+	}
+
+	probed := 0
+	for _, m := range models {
+		if !manual {
+			if _, ok := fresh[m]; ok {
+				continue // 记录仍新鲜，跳过
+			}
+		}
+		e := p.probeOne(acct, m)
+		merged[m] = e
+		probed++
+	}
+
+	entries := make([]AvailEntry, 0, len(merged))
+	for _, m := range models { // 只保留当前目录里仍存在的模型
+		if e, ok := merged[m]; ok {
+			entries = append(entries, e)
+		}
+	}
+	if probed > 0 {
+		if err := p.saveAvail(entries); err != nil {
+			// 落盘失败不影响本次结果返回，只是下次要重探。
+			log.Printf("panel: 模型可用性探测结果落盘失败: %v", err)
+		}
+	}
+	return entries, nil
+}
+
+var (
+	errNoUpstream      = errors.New("upstream not available")
+	errNoGlobalAccount = errors.New("池中没有可用的国际版账号，无法探测")
+	errNoModelCatalog  = errors.New("上游未返回国际版模型目录，无法探测")
+)
+
+// modelsProbe POST /panel/api/models/probe —— 手动探测全部 global 模型。
+//
+// 同步执行：35 个模型约 6–25 秒。前端带「探测中」提示即可；改成异步 + 轮询
+// 会让面板多一套状态机，而这是低频操作，不值得。
+func (p *Panel) modelsProbe(w http.ResponseWriter, r *http.Request) {
+	if !availProbeMu.TryLock() {
+		writeErr(w, http.StatusConflict, "探测正在进行中，请稍候")
 		return
 	}
+	defer availProbeMu.Unlock()
 
-	entries := make([]AvailEntry, 0, len(models))
-	for _, m := range models {
-		entries = append(entries, p.probeOne(acct, m))
+	entries, err := p.runAvailProbe(true) // 手动：全量
+	if err != nil {
+		switch {
+		case errors.Is(err, errNoUpstream):
+			writeErr(w, http.StatusNotImplemented, err.Error())
+		case errors.Is(err, errNoGlobalAccount):
+			writeErr(w, http.StatusServiceUnavailable, err.Error())
+		default:
+			writeErr(w, http.StatusBadGateway, err.Error())
+		}
+		return
 	}
-	if err := p.saveAvail(entries); err != nil {
-		// 落盘失败不影响本次结果返回，只是下次要重探。
-		log.Printf("panel: 模型可用性探测结果落盘失败: %v", err)
-	}
-
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":      true,
 		"checked": len(entries),
@@ -198,12 +288,91 @@ func (p *Panel) modelsProbe(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// StartAvailProbe 后台周期性探测模型可用性（独立 ticker goroutine，ctx 取消即停）。
+//
+// 为什么需要它：探测端点此前**只能手动点**，而面板的「待验证」是静默的——
+// 没人点按钮，三十多个国际版模型就永远是灰字。用户看到的表象是「探测间隔太长」，
+// 实际是「根本没有自动探测」。
+//
+// 首轮立即执行（不等一个 interval）：进程重启后模型目录可能已变，而重启本身
+// 往往发生在部署/排障之后，此时最需要一份新鲜结论。
+func (p *Panel) StartAvailProbe(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	p.availInterval.Store(int64(interval))
+	go func() {
+		// 启动后先等一小段：与容器启动期的凭据加载 / 模型目录拉取错开，
+		// 否则首轮可能因为 auths 还没就绪而空跑。
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(30 * time.Second):
+		}
+		p.probeOnceLogged("startup")
+		var logged time.Duration
+		for {
+			cur := time.Duration(p.availInterval.Load())
+			if cur != logged {
+				log.Printf("panel: 模型可用性自动探测每 %s", cur)
+				logged = cur
+			}
+			timer := time.NewTimer(cur)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+				p.probeOnceLogged("schedule")
+			}
+		}
+	}()
+}
+
+// probeOnceLogged 跑一轮探测并按结果记日志。失败只记一行，不影响下一轮。
+func (p *Panel) probeOnceLogged(trigger string) {
+	if !availProbeMu.TryLock() {
+		return // 手动探测正在进行，本轮让位
+	}
+	defer availProbeMu.Unlock()
+	entries, err := p.runAvailProbe(false) // 自动：增量
+	if err != nil {
+		log.Printf("panel: 模型可用性自动探测（%s）跳过: %v", trigger, err)
+		return
+	}
+	counts := map[string]int{}
+	for _, e := range entries {
+		counts[e.Level]++
+	}
+	log.Printf("panel: 模型可用性自动探测（%s）完成 %d 个模型 %v", trigger, len(entries), counts)
+}
+
+// SetAvailProbeInterval 热改探测间隔（下一轮生效；0 = 暂停）。
+func (p *Panel) SetAvailProbeInterval(d time.Duration) {
+	p.availInterval.Store(int64(d))
+}
+
+// probeBody 构造探测请求体。
+//
+// 出站必须发**裸模型名**：realm 前缀（cn: / global:）是网关侧的路由协议，上游不认。
+// 绕过网关直调 ChatStream 就绕过了 handler.go:887 的 rewriteModel，前缀原样发给
+// 上游 → 每个模型都返回 11102 model_blocked（实测 35/35 全中，面板因此把所有模型
+// 都标成「上游无此模型」）。
+//
+// 条目仍以带前缀的 id 作为 key（面板按 global:xxx 取用），只改请求体的 model。
+// 请求体压到最小：max_tokens=1 + 单字符 prompt，实测 credit=0。
+func probeBody(model string) []byte {
+	bare := strings.TrimPrefix(model, "global:")
+	bare = strings.TrimPrefix(bare, "cn:")
+	return []byte(`{"model":` + quoteJSON(bare) +
+		`,"messages":[{"role":"user","content":"1"}],"max_tokens":1}`)
+}
+
 // probeOne 对单个模型发一次最小请求并归类。
 func (p *Panel) probeOne(acct *auth.Auth, model string) AvailEntry {
 	e := AvailEntry{Model: model, CheckedAt: time.Now()}
 
-	body := []byte(`{"model":` + quoteJSON(model) +
-		`,"messages":[{"role":"user","content":"1"}],"max_tokens":1}`)
+	body := probeBody(model)
 
 	rc, status, respBody, err := p.cfg.Upstream.ChatStream(acct, body, "", upstream.ChatMeta{})
 	e.Status = status
