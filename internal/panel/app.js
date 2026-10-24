@@ -811,7 +811,7 @@ function mdSortList(list, f) {
 // mdAvailabilityOf 合成 Global 模型当前可用性：模型锁优先于最近请求结果。
 // 只返回有真实本地证据的状态；目录中存在但从未请求过的模型标为“待验证”，
 // 避免把“上游列出了模型”误当成“当前账号有权限”。
-function mdAvailabilityOf(m, locks, recent) {
+function mdAvailabilityOf(m, locks, recent, avail) {
   const id = String((m && m.id) || '');
   if (!id.startsWith('global:')) return null;
   locks = Array.isArray(locks) ? locks : mdLocks;
@@ -842,7 +842,12 @@ function mdAvailabilityOf(m, locks, recent) {
   }
   // 持久探测证据（models/probe 落盘 24h）：比「最近 100 条请求」更可靠——
   // 国际版模型很少进入那个滚动窗口，只看它会让三十多个模型长期显示「待验证」。
-  const av = mdAvail[id];
+  // avail 参数优先（便于单测注入）；缺省回落模块级 mdAvail。
+  // 用 typeof 守卫：Go 里的前端测试只截取本函数所在片段执行，模块级 mdAvail 不在
+  // 该切片内，直接引用会 ReferenceError（CI 用 node 跑，本地容器无 node 会跳过）。
+  const avMap = (avail && typeof avail === 'object') ? avail
+    : (typeof mdAvail !== 'undefined' ? mdAvail : {});
+  const av = avMap[id];
   if (av) {
     const when = av.checked_at ? new Date(av.checked_at).toLocaleString('zh-CN', { hour12: false }) : '';
     if (av.level === 'ok') {
