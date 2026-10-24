@@ -284,12 +284,13 @@ func TestRefreshSessionDead(t *testing.T) {
 }
 
 func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
-	var gotAuth, gotUID, gotProduct string
+	var gotAuth, gotUID, gotProduct, gotIDEName string
 	var gotBody []byte
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		gotAuth = r.Header.Get("Authorization")
 		gotUID = r.Header.Get("X-User-Id")
 		gotProduct = r.Header.Get("X-Product")
+		gotIDEName = r.Header.Get("X-IDE-Name")
 		gotBody, _ = io.ReadAll(r.Body)
 		return &http.Response{
 			StatusCode: 200,
@@ -306,8 +307,18 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		t.Errorf("200 response should carry nil body, got %q", respBody)
 	}
 	rc.Close()
-	if gotAuth != "Bearer at" || gotUID != "u1" || gotProduct != "WorkBuddy" {
-		t.Errorf("headers: auth=%q uid=%q product=%q", gotAuth, gotUID, gotProduct)
+	// X-Product 与 X-IDE-Name 取值来源不同，必须分开断言：
+	//   - X-Product = product.json 的 deploymentType（"SaaS"）；
+	//   - X-IDE-Name = 桌面端传给内置 CLI 的应用名（"WorkBuddy"）。
+	// 此前这条断言把两者都当 "WorkBuddy"，掩盖了 X-Product 的偏离。
+	if gotAuth != "Bearer at" || gotUID != "u1" {
+		t.Errorf("headers: auth=%q uid=%q", gotAuth, gotUID)
+	}
+	if gotProduct != "SaaS" {
+		t.Errorf("X-Product=%q want \"SaaS\"（官方 deploymentType）", gotProduct)
+	}
+	if gotIDEName != "WorkBuddy" {
+		t.Errorf("X-IDE-Name=%q want \"WorkBuddy\"（官方 IDE_TYPE）", gotIDEName)
 	}
 	if !bytes.Contains(gotBody, []byte(`"stream":true`)) {
 		t.Errorf("stream not forced: %s", gotBody)

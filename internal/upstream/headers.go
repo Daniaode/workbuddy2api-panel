@@ -21,6 +21,10 @@ const (
 	// config upstream.cli_version 可覆盖（空 = 内置默认）。
 	defaultCliVersion = "2.137.1"
 
+	// deploymentType 官方 product.json 的 deploymentType（两个安装包都是 SaaS），
+	// 由 ProductEndpointHttpInterceptor 作为 X-Product 加到每个请求上。
+	deploymentType = "SaaS"
+
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
 )
@@ -143,26 +147,48 @@ func (c *Client) injectAccountStableHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("X-Session-ID", deriveAccountStableID(a.UID, "session"))
 }
 
+// headerProfile 生效的出站请求头形状。
+//
+// 空值按 official 处理——这是「对齐官方」的默认，legacy 仅作一键还原通道。
+func (c *Client) headerProfile() string {
+	if c != nil && c.HeaderProfile == "legacy" {
+		return "legacy"
+	}
+	return "official"
+}
+
+// legacyHeaders 报告是否走旧形状（发送官方并不发的五个头）。
+func (c *Client) legacyHeaders() bool { return c.headerProfile() == "legacy" }
+
 // CommonHeaders 设置所有 API 共享的请求头。
 func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Content-Type", "application/json")
-	// Accept 非流式默认 application/json（D6：去掉宽松的 text/plain, */*）。
-	// chat 流式路径在 ChatHeaders 覆盖为 event-stream。
-	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	origin := originRefererFor(a)
-	req.Header.Set("Origin", origin)
-	req.Header.Set("Referer", origin+"/")
 	req.Header.Set("User-Agent", c.userAgent(a))
-	// X-CodeBuddy-Request: 1（官方客户端风控闸门头，所有 API 请求必带，D1）。
-	req.Header.Set("X-CodeBuddy-Request", "1")
-	// Accept-Language 按 realm 切（D5）：CN zh-CN，global en-US。官方客户端按账号域
-	// 发对应语言标识，对齐避免上游风控按语言缺失误判。
+	// Accept-Language 按 realm 切：CN zh-CN，global en-US。
 	req.Header.Set("Accept-Language", acceptLanguageFor(a))
-	// X-Machine-ID / X-Session-ID：按 uid 稳定派生的账号级设备头（见
-	// injectAccountStableHeaders）。注入在 CommonHeaders——chat 经 ChatHeaders
-	// 叠加 CommonHeaders 天然继承；billing 域另行注入，全出站覆盖。
-	c.injectAccountStableHeaders(req, a)
+
+	if c.legacyHeaders() {
+		// ── legacy：保留 2026-09 那套「防风控」推断头 ──
+		// 这五个头官方客户端并不发（见 docs/official-client.md）。保留只为
+		// 上游行为变化时能一键还原，不必改代码重新构建。
+		req.Header.Set("Accept", "application/json")
+		origin := originRefererFor(a)
+		req.Header.Set("Origin", origin)
+		req.Header.Set("Referer", origin+"/")
+		req.Header.Set("X-CodeBuddy-Request", "1")
+		c.injectAccountStableHeaders(req, a)
+		return
+	}
+
+	// ── official：照官方客户端的实际取值 ──
+	// Accept 用官方的宽松值；chat 路径随后覆盖为流式形态。
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	// X-Request-ID：32 位十六进制，每个请求新生成（官方 CommonHeaderHttpInterceptor）。
+	// chat 路径随后用消息级 id 覆盖同一个头，与官方一致。
+	req.Header.Set("X-Request-ID", session.NewMessageID())
+	// 不发 Origin / Referer / X-CodeBuddy-Request / X-Machine-ID / X-Session-ID：
+	// 实测四组对照（chat、余额、成长任务、连登）去掉后全部 200，见 docs/official-client.md。
 }
 
 // acceptLanguageFor 按账号 realm 返回 Accept-Language：global → en-US，cn → zh-CN。
@@ -176,6 +202,9 @@ func acceptLanguageFor(a *auth.Auth) string {
 // injectCodeBuddyRequest 在 req 注入 X-CodeBuddy-Request: 1。
 // billing 域未走 CommonHeaders，单独注入保证全出站覆盖（D1）。
 func (c *Client) injectCodeBuddyRequest(req *http.Request) {
+	if !c.legacyHeaders() {
+		return // official：官方不发这个头
+	}
 	req.Header.Set("X-CodeBuddy-Request", "1")
 }
 
@@ -232,6 +261,16 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	}
 	// 用量归属头：默认伪造 WorkBuddy 桌面端指纹（client_name="SaaS" 还原旧行为）。
 	c.injectAttribution(req)
+	if !c.legacyHeaders() {
+		// 官方对话请求另带这三个头（docs/official-client.md）：
+		//   X-Agent-Intent/X-Agent-Type 标识 agent 调用意图与类型；
+		//   X-Private-Data=true 表示不允许上游拿对话做模型优化——官方在
+		//   enableModelOptimization 未设且产品开关为真时发 "true"，与本网关
+		//   不做模型优化的默认一致，所以直接发 true 而不是省略。
+		req.Header.Set("X-Agent-Intent", "craft")
+		req.Header.Set("X-Agent-Type", "main")
+		req.Header.Set("X-Private-Data", "true")
+	}
 	// 客户端 IP 透传（仅 PassthroughIP=true 且本次请求带 IP）。
 	c.injectClientIP(req, clientIP)
 	// 设备风控头：auth 每号 > config 全局 > 文件兜底；空则不注入。
@@ -280,7 +319,10 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	// 不再因为「透传优先」而漏发该头（issue #190）。
 	conversationID := meta.ConversationID
 	if conversationID == "" {
-		conversationID = session.NewMessageID()
+		// 官方 X-Conversation-ID 是**带连字符**的 uuidv7（36 位，见
+		// docs/official-client.md「会话 id 与链路头」）；轮次/消息 id 才是
+		// 去掉连字符的 32 位。这里此前统一用 32 hex，形态与官方不同。
+		conversationID = session.NewUUIDv7()
 	}
 	req.Header.Set("X-Conversation-ID", conversationID)
 	req.Header.Set("X-Conversation-Request-ID", convReqID)
@@ -343,6 +385,15 @@ func (c *Client) injectAttribution(req *http.Request) {
 	req.Header.Set("X-IDE-Name", name)
 	req.Header.Set("X-IDE-Type", name)
 	req.Header.Set("X-IDE-Version", c.clientVersion())
+	// X-Product 与 X-IDE-* 取值来源不同，不能一起跟随 name：
+	//   - X-Product 是产品配置里的 deploymentType，两个安装包都是 "SaaS"
+	//     （官方 ProductEndpointHttpInterceptor）；
+	//   - X-IDE-Name/Type 是桌面端传给内置 CLI 的应用名（"WorkBuddy"）。
+	// 旧实现把两者都设成 name（"WorkBuddy"），X-Product 因此偏离官方取值。
+	if !c.legacyHeaders() {
+		req.Header.Set("X-Product", deploymentType)
+		return
+	}
 	req.Header.Set("X-Product", name)
 }
 

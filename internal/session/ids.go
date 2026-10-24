@@ -10,11 +10,13 @@ package session
 import (
 	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"strings"
+	"time"
 )
 
 // ResolveConversationID 从请求体提取会话头族的 conversationId（snake/camel 双形态，
@@ -226,4 +228,37 @@ func TurnRequestID(turnKey string) string {
 	}
 	sum := sha256.Sum256([]byte(deriveSalt + "|" + turnKey))
 	return hex.EncodeToString(sum[:16])
+}
+
+// ─── 官方 ID 形态生成器（UUID v7）─────────────────────────────────────────
+//
+// 背景：出站请求里的会话 id / 轮次 id / 消息 id，官方客户端都是 `uuidv7()`
+// 去掉连字符的 32 位十六进制。旧实现用 `fmt.Sprintf("wb2api-mp-%d", ms)` 这类
+// 字面量拼装，形态与官方完全不同——上游只要看一眼 ID 形状就能分出「不是官方
+// 客户端发的」，比 UA、比请求头都更直接。
+//
+// 对照依据见 docs/official-client.md「会话 id 与链路头」。以下三个函数只保证
+// **形态**与官方一致（版本位 7、RFC 9562 变体位、时间有序），不保证取值来源相同。
+
+// NewUUIDv7 返回带连字符的 UUID v7（8-4-4-4-12）。
+func NewUUIDv7() string {
+	h := NewUUIDv7Hex()
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
+}
+
+// NewUUIDv7Hex 返回去掉连字符的 UUID v7（32 位小写十六进制）。
+//
+// 前 48 位是毫秒时间戳（大端），第 7 版版本位，第 9 字节高两位是 RFC 9562 变体。
+// 熵源失败时退回 math/rand/v2，仍保证格式合法——ID 格式非法比 ID 重复更难排查。
+func NewUUIDv7Hex() string {
+	var b [16]byte
+	if _, err := cryptorand.Read(b[6:]); err != nil {
+		binary.BigEndian.PutUint64(b[8:], rand.Uint64())
+		binary.BigEndian.PutUint16(b[6:], uint16(rand.Uint32()))
+	}
+	ms := uint64(time.Now().UnixMilli())
+	b[0], b[1], b[2], b[3], b[4], b[5] = byte(ms>>40), byte(ms>>32), byte(ms>>24), byte(ms>>16), byte(ms>>8), byte(ms)
+	b[6] = 0x70 | b[6]&0x0f // 版本 7
+	b[8] = 0x80 | b[8]&0x3f // RFC 9562 变体
+	return hex.EncodeToString(b[:])
 }

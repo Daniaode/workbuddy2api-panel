@@ -756,6 +756,18 @@ type Client struct {
 	// 缺省 false（反代安全边界）；handler 在 chat 路径按请求把 clientIP 传入 ChatStream。
 	PassthroughIP bool
 
+	// HeaderProfile 出站请求头形状：official（默认）/ legacy。
+	//
+	// official 去掉官方客户端根本不发的五个头：Origin、Referer、
+	// X-CodeBuddy-Request、X-Machine-ID、X-Session-ID，并把 Accept 改成官方的
+	// "application/json, text/plain, */*"。
+	//
+	// 为什么做成开关而不是直接删：这五个头是当年按「防风控」的推断加上的，
+	// 官方实际不发（见 docs/official-client.md）。实测四组对照（chat + 余额 +
+	// 成长任务 + 连登）在去掉后全部 200，所以默认切到 official；但上游行为可能
+	// 变化，留 legacy 一键还原，不必改代码重新构建。
+	HeaderProfile string
+
 	// DeviceToken 设备风控 Token（X-Device-Token 头）全局兜底来源：config upstream.device_token。
 	// 解析优先级：auth.Auth.DeviceToken > DeviceToken（config）> DeviceTokenFile（文件）。
 	DeviceToken string

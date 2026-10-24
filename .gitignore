@@ -32,11 +32,15 @@ backups/
 LOOP.md
 PLAN.md
 SPEC.md
-docs/
-
-# 设计/计划文档（但 README.md 必须进版本库）
+# docs/ 下的设计/计划文档不进版本库，但「官方客户端对照」是长期维护依据，必须进。
+# 两条注意：
+#   1) 不能写成 `docs/` —— 目录整体被排除后，目录内的 ! 例外不生效；
+#   2) 例外必须排在 `*.md` **之后** —— gitignore 按顺序生效，
+#      先写的 ! 会被后写的通配规则重新忽略。
+docs/*
 *.md
 !README.md
+!docs/official-client.md
 
 # Windows binaries
 /wb2api.exe

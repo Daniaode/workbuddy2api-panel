@@ -167,6 +167,11 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// HeaderProfile 出站请求头形状：official（默认，照官方客户端）/ legacy（旧形状）。
+		// official 不发 Origin/Referer/X-CodeBuddy-Request/X-Machine-ID/X-Session-ID，
+		// 并把 Accept 改成官方的 "application/json, text/plain, */*"。
+		// 留 legacy 是为上游行为变化时一键还原，不必改代码重新构建。
+		HeaderProfile string `json:"header_profile"`
 	} `json:"upstream"`
 
 	Features struct {

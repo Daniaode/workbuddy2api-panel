@@ -9,9 +9,15 @@ import (
 )
 
 // TestChatHeadersAlwaysSendConversationTrio 回归 issue #190：国际端点收紧通道
-// 校验后，缺 X-Conversation-ID 的聊天请求会 400 / 11128（conversation id
-// missing）。即使调用方没给会话 ID（零值 ChatMeta），三元组也必须齐全，
-// 且兜底 ID 是 32 位 hex。
+// 校验后，缺 X-Conversation-ID 的聊天请求会 400 / 11-128（conversation id
+// missing）。即使调用方没给会话 ID（零值 ChatMeta），三元组也必须齐全。
+//
+// 形态按官方逐一区分（docs/official-client.md「会话 id 与链路头」）：
+//   - X-Conversation-ID：带连字符的 uuidv7（36 位），整段对话不变；
+//   - X-Conversation-Request-ID / X-Conversation-Message-ID：uuidv7 去掉连字符（32 位）。
+//
+// 此前这里统一断言 32 hex——那是旧实现的形态，与官方不一致。两种形态实测都返回
+// 200，所以对齐不会引发 11-128。
 func TestChatHeadersAlwaysSendConversationTrio(t *testing.T) {
 	c := &Client{}
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/v2/chat/completions", nil)
@@ -20,9 +26,19 @@ func TestChatHeadersAlwaysSendConversationTrio(t *testing.T) {
 	}
 	c.ChatHeaders(req, testAuth(), "", ChatMeta{})
 
+	// 36 位带连字符的 uuidv7（版本位 7、RFC 9562 变体位）。
+	uuid7Dashed := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	// 32 位十六进制（uuidv7 去连字符）。
 	hex32 := regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+	conv := req.Header.Get("X-Conversation-ID")
+	if conv == "" {
+		t.Fatal("X-Conversation-ID missing (通道校验会拒绝缺少会话三元组的请求)")
+	}
+	if !uuid7Dashed.MatchString(conv) {
+		t.Errorf("X-Conversation-ID = %q, want 36 位带连字符 uuidv7（官方形态）", conv)
+	}
 	for _, h := range []string{
-		"X-Conversation-ID",
 		"X-Conversation-Request-ID",
 		"X-Conversation-Message-ID",
 	} {
@@ -31,15 +47,8 @@ func TestChatHeadersAlwaysSendConversationTrio(t *testing.T) {
 			t.Fatalf("%s missing (通道校验会拒绝缺少会话三元组的请求)", h)
 		}
 		if !hex32.MatchString(v) {
-			t.Errorf("%s = %q, want 32 hex", h, v)
+			t.Errorf("%s = %q, want 32 hex（官方去掉连字符）", h, v)
 		}
-	}
-
-	// 兜底会话 ID 每次请求新生成（不是常量），且与 request/message ID 不冲突。
-	req2, _ := http.NewRequest(http.MethodPost, "https://example.com/v2/chat/completions", nil)
-	c.ChatHeaders(req2, testAuth(), "", ChatMeta{})
-	if req.Header.Get("X-Conversation-ID") == req2.Header.Get("X-Conversation-ID") {
-		t.Error("fallback X-Conversation-ID should be fresh per request")
 	}
 }
 
