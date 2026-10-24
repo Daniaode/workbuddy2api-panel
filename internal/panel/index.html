@@ -675,6 +675,29 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
       </div>
 
+      <!-- 分池视图：国内版与国际版各一池，各自有独立调度策略与在途上限，所以
+           分开显示才看得出「哪一池在扛量、哪一池在冷却」。数据来自 overview 的
+           realm_totals（CountsDetailedForRealm），零额外上游请求。 -->
+      <div class="box" id="realmBox">
+        <header>
+          <h3>分池状态<span class="hint">国内版 / 国际版各自独立调度；模型名前缀 cn: / global: 可指定走哪一池</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="realmNote"></span>
+        </header>
+        <div class="pad">
+          <div class="tbl-wrap">
+            <table class="acc">
+              <thead><tr>
+                <th>池</th><th class="num">账号</th><th class="num">可用</th>
+                <th class="num">冷却</th><th class="num">暂停</th><th class="num">禁用</th>
+                <th class="num">在途占满</th>
+              </tr></thead>
+              <tbody id="realmBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
       <!-- 卡片默认可见：此前 hidden + 「仅点检查才渲染」形成死锁（按钮藏在隐藏卡片里，
            用户看不到也就点不到，issue #137）。现在进页面即用 /overview 的到期快照渲染
            （数据来自 state.json，不经上游），「检查」按钮改为拉取逐包明细的增强入口。 -->
@@ -1096,6 +1119,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             </div>
             <div class="switch"><span class="lb">快过期积分优先</span>
               <input type="checkbox" name="prefer_expiring"></div>
+            <div class="switch"><span class="lb">跨域负载均衡（两池合池分担）</span>
+              <input type="checkbox" name="cross_realm"></div>
+            <div class="hint"><b>跨域负载均衡</b>（<code>pool.cross_realm</code>，默认关闭）：不带前缀的模型名按两域模型目录分流——<b>两域都有该模型时在两个池之间一起加权分担</b>，只有一域有时路由到那一域。<br>
+              与下一项的区别：<b>回退</b>是「国内版优先，国内没号了才用国际版」；<b>负载均衡</b>是两池同时接量。<br>
+              显式写 <code>cn:</code> / <code>global:</code> 前缀时永远钉死该域，两种模式都不改写。跨域会消耗另一域的额度，属策略选择。</div>
+            <div class="switch"><span class="lb">跨域回退（国内优先，无号才用国际）</span>
+              <input type="checkbox" name="cross_domain_fallback"></div>
+            <div class="hint"><b>跨域回退</b>（<code>pool.cross_domain_fallback</code>，默认关闭）：不带前缀的模型名<b>先钉在国内版</b>，选不到可用账号时才改用国际版再试一次。<br>
+              两项可同时打开：负载均衡负责分流，回退作为兜底。</div>
           </div>
         </div>
 

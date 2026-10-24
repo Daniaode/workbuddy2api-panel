@@ -252,6 +252,25 @@ func poolExpiryBuckets(in []upstream.ExpiryBucket) []pool.ExpiryBucket {
 // ---------------------------------------------------------------------------
 
 // overview 总览：池计数 + 每账号状态 + 面板元信息。
+// realmTotals 按 realm 聚合账号计数，供面板分池视图。
+//
+// 为什么在面板侧单独算而不是复用 /status：面板不该为了一个分组卡片去调自己的
+// HTTP 接口（多一次序列化 + 鉴权）；CountsDetailedForRealm 是池子现成的只读入口，
+// 三次遍历（cn / global / 合计）成本可忽略。
+func (p *Panel) realmTotals() map[string]map[string]int {
+	build := func(realm string) map[string]int {
+		t, h, c, d, paused, f := p.cfg.Pool.CountsDetailedForRealmWithPaused(realm)
+		return map[string]int{
+			"total": t, "healthy": h, "cooling": c,
+			"disabled": d, "paused": paused, "in_flight_full": f,
+		}
+	}
+	return map[string]map[string]int{
+		"cn":     build("cn"),
+		"global": build("global"),
+	}
+}
+
 func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	// 用 WithPaused 而不是 CountsDetailed：后者把暂停号并进 disabled（/status 的
 	// 「不可用」口径），而概况卡片要分开展示（issue #125）。
@@ -268,11 +287,15 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"sticky_sessions": sticky,
 		"total":           total,
 		"healthy":         healthy,
-		"cooling":         cooling,
-		"disabled":        disabled,
-		"paused":          paused,
-		"in_flight_full":  inFlightFull,
-		"accounts":        p.cfg.Pool.List(),
+		// realm_totals 按域分组的计数（双池管理视图）：国内版与国际版账号在
+		// 同一面板里分开看，才看得出「哪一池在扛量、哪一池在冷却」。
+		// 与 /status 的 realm_totals 同口径（CountsDetailedForRealm）。
+		"realm_totals":   p.realmTotals(),
+		"cooling":        cooling,
+		"disabled":       disabled,
+		"paused":         paused,
+		"in_flight_full": inFlightFull,
+		"accounts":       p.cfg.Pool.List(),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),

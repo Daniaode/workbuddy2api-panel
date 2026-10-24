@@ -472,6 +472,48 @@ function renderAccounts(list) {
   }).join('');
 }
 
+// renderRealmPools 分池视图：国内版 / 国际版各一池的计数。
+//
+// 为什么单独一块而不是把账号表按域分组：两池有各自独立的调度策略（国内版可能在
+// 轮询、国际版可能在加权随机）和在途上限，混在一张表里看不出「哪一池在扛量」。
+// 账号明细仍在下面那张表里（带「国际版」标签），这里只回答池级的四个数。
+function renderRealmPools(totals) {
+  const tb = $('realmBody');
+  if (!tb) return;
+  const note = $('realmNote');
+  const defs = [
+    { key: 'cn', name: '国内版', tag: '' },
+    { key: 'global', name: '国际版', tag: 'global' },
+  ];
+  let rows = '';
+  let cnH = 0, glH = 0, cnT = 0, glT = 0;
+  for (const d of defs) {
+    const r = (totals && totals[d.key]) || {};
+    const t = r.total || 0, h = r.healthy || 0;
+    if (d.key === 'cn') { cnT = t; cnH = h; } else { glT = t; glH = h; }
+    const badge = h > 0 ? '<span class="tag ok">可用</span>'
+      : (t > 0 ? '<span class="tag warn">无可用</span>' : '<span class="tag">空池</span>');
+    rows += '<tr>' +
+      '<td><b>' + d.name + '</b> ' + badge + '</td>' +
+      '<td class="num">' + t + '</td>' +
+      '<td class="num">' + h + '</td>' +
+      '<td class="num">' + (r.cooling || 0) + '</td>' +
+      '<td class="num">' + (r.paused || 0) + '</td>' +
+      '<td class="num">' + (r.disabled || 0) + '</td>' +
+      '<td class="num">' + (r.in_flight_full || 0) + '</td>' +
+      '</tr>';
+  }
+  tb.innerHTML = rows;
+  if (note) {
+    // 空池要明确说出来：国际版 0 个账号时，「cn: 和 global: 模型都在列表里」
+    // 会让人以为两池都能用，实际 global: 会 503。
+    const empty = [];
+    if (cnT === 0) empty.push('国内版');
+    if (glT === 0) empty.push('国际版');
+    note.textContent = empty.length ? (empty.join(' / ') + ' 无账号') : '';
+  }
+}
+
 // renderModelLocks 模型锁池：哪些模型不能用、锁了几个号、还要锁多久。
 // 后端 model_locks 已按「整池不可用 → 没号可用 → 部分限流」排好序，这里只做展示。
 function renderModelLocks(rows) {
@@ -532,6 +574,7 @@ async function loadOverview(quiet) {
     const up = Math.floor(d.uptime_sec);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
     renderAccounts(d.accounts || []);
+    renderRealmPools(d.realm_totals);
     renderModelLocks(d.model_locks);
     // 到期卡片跟随首页统计同步刷新（用同一份响应里的按日批次，不额外发请求）。
     // 2 分钟内的实时明细最新且更全，保留；过期后由 state 快照接管，避免点过一次
@@ -1160,6 +1203,7 @@ const CFG_MAP = {
   degrade_cooldown_max: ['pool', 'degrade_cooldown_max'],
   cost_explore_interval: ['pool', 'cost_explore_interval'],
   credit_floor: ['pool', 'credit_floor'],
+  cross_realm: ['pool', 'cross_realm'], cross_domain_fallback: ['pool', 'cross_domain_fallback'],
   prefer_expiring: ['pool', 'prefer_expiring'], expiring_soon: ['pool', 'expiring_soon'],
   soft_rate: ['cooldown', 'soft_rate'], soft_rate_max: ['cooldown', 'soft_rate_max'],
   breaker_cooldown: ['pool', 'breaker_cooldown'], breaker_cooldown_max: ['pool', 'breaker_cooldown_max'],

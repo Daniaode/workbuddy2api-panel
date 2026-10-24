@@ -245,6 +245,17 @@ type Config struct {
 		// 另一域再选一次；显式 cn:/global: 前缀不受影响，行为与引入前完全一致。
 		// 语义取舍：跨域会消耗另一个域的额度，属策略选择，故默认关闭、显式开启。
 		CrossDomainFallback bool `json:"cross_domain_fallback"`
+		// CrossRealm 跨域负载均衡（默认 false）。
+		//
+		// 与 CrossDomainFallback 的区别（两者可并存，语义不同）：
+		//   - CrossDomainFallback：裸名**先钉在 cn**，cn 选不到号时才改用 global（回退）；
+		//   - CrossRealm：裸名**按两域模型目录分流**——两域都有该模型时不加域过滤，
+		//     在国内版 + 国际版的全部健康账号里一起加权选号（合池负载均衡）；
+		//     只有一域有该模型时路由到那一域。
+		//
+		// 显式 cn:/global: 前缀在两种模式下都钉死该域，永不被改写。
+		// 跨域会消耗另一个域的额度，属策略选择，故默认关闭。
+		CrossRealm bool `json:"cross_realm"`
 	} `json:"pool"`
 
 	SessionSticky struct {

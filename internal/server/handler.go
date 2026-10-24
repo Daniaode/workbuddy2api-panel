@@ -486,6 +486,79 @@ func (h *Handler) modelList() []map[string]any {
 	return out
 }
 
+// modelHidden 判定 (域, 模型) 是否被 models.hidden 屏蔽。
+// realm 为空 = 合池模式，此时任一域被屏蔽即视为屏蔽（黑名单是运维的安全阀，
+// 不该因为跨域负载均衡而半开）。
+func (h *Handler) modelHidden(realm, bare string) bool {
+	hidden := h.loadLive().HiddenModels
+	if realm == "" {
+		_, cn := hidden["cn:"+bare]
+		_, gl := hidden["global:"+bare]
+		return cn || gl
+	}
+	_, hide := hidden[realm+":"+bare]
+	return hide
+}
+
+// crossRealmFor 跨域负载均衡下，不带前缀的模型名该在哪个域选号。
+//
+// 三个返回值语义：
+//   - realm = ""      → 两域目录都有该模型，选号**不加域过滤**（合池加权分担）；
+//   - realm = "cn"/"global" → 只有该域有，钉死这一域；
+//   - routed = false  → 两域目录都没有（未拉到/模型不存在），调用方保持原语义（cn）。
+//
+// 为什么必须按目录分流而不是「两域都试」：同一个模型名在两个域背后是不同供应商
+// 部署，能力/倍率/上下文都可能不同。盲试会让「明确只在一域存在的模型」有一半请求
+// 打空并触发 11102 负缓存。
+//
+// 目录来源都走既有缓存（cn 10min / global 1h，各自带失败负缓存），因此本方法在
+// 稳态下零上游调用；冷启动时最多各触发一次，与 /v1/models 的代价相同。
+func (h *Handler) crossRealmFor(bare string) (realm string, routed bool) {
+	if bare == "" {
+		return "", false
+	}
+	hasCN := false
+	for _, mi := range h.fetchDynamicModels() {
+		if mi.ID == bare {
+			hasCN = true
+			break
+		}
+	}
+	hasGlobal := false
+	if names, _ := h.fetchGlobalModels(); len(names) > 0 {
+		for _, id := range names {
+			if id == bare {
+				hasGlobal = true
+				break
+			}
+		}
+	}
+	return realmForCatalog(hasCN, hasGlobal)
+}
+
+// realmForCatalog 是 crossRealmFor 的纯决策部分（无 IO），单独可测。
+//
+//   - 两域都有 → ("", true)：选号不加域过滤，两池合池加权分担；
+//   - 只有 global → ("global", true)；
+//   - 只有 cn → ("cn", true)；
+//   - 都没有 → ("", false)：调用方保持原语义（裸名默认 cn），不因目录缺失改写路由。
+//
+// 「都没有」必须与「两域都有」区分开：前者是目录未拉到或模型不存在，保持旧行为；
+// 后者是确定的合池。把两者都返回 "" 会让「目录还没预热」变成「静默合池」，
+// 把请求分到没有该模型的域上去撞 11102。
+func realmForCatalog(hasCN, hasGlobal bool) (realm string, routed bool) {
+	switch {
+	case hasCN && hasGlobal:
+		return "", true
+	case hasGlobal:
+		return "global", true
+	case hasCN:
+		return "cn", true
+	default:
+		return "", false
+	}
+}
+
 // fetchGlobalModels 返回 global 模型名单（纯动态探测结果）及被探测账号。
 // 缓存/失败回落封在 upstream.FetchGlobalModels（内部 1h + 5min 负缓存）。
 // 本方法只负责"何时探测"：池中无 global 账号 → 空名单 + nil 账号（零上游调用）。
@@ -598,15 +671,33 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel, realmExplicit := resolveModelDetail(peek.Model)
-	modelRate := ""
-	if h.cfg.Upstream != nil {
-		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
-	}
+
 	// 跨域回退（issue #135）：只有裸模型名 + 显式开启 pool.cross_domain_fallback 时生效。
 	// 语义 = 「裸名不绑定单一域」：首选域（裸名默认 cn）选不到可用号（账号级冷却/熔断/
 	// 在途占满，或该域账号对这个模型 11102 后进入模型级负缓存）时，改用另一域再选一次；
 	// 显式 cn:/global: 前缀保持原语义，永不回退。
-	crossRealm := !realmExplicit && h.cfg.Pool.CrossDomainFallback()
+	crossFallback := !realmExplicit && h.cfg.Pool.CrossDomainFallback()
+
+	// 跨域负载均衡（pool.cross_realm，热生效）：与上面的「回退」是两种不同语义——
+	// 回退是「cn 优先，cn 没号才用 global」；这里是「两域合池，一起加权分担」。
+	// 只作用于裸模型名；显式 cn:/global: 前缀永远钉死该域。
+	// 按模型目录分流：两域都有该模型 → realm=""（选号不加域过滤，合池）；
+	// 只有一域有 → 该域；两域目录都没有 → 保持原语义（cn）。
+	balanced := false
+	if !realmExplicit && h.loadLive().CrossRealm && h.cfg.GlobalEnabled && h.cfg.Upstream != nil {
+		if r, routed := h.crossRealmFor(bareModel); routed {
+			realm = r
+			balanced = true
+		}
+	}
+	// crossRealm 是两种模式的并集，供下游「跨域相关」分支共用：
+	// 粘性解绑、二次选号、倍率重算都只关心「本次允许跨域」。
+	crossRealm := crossFallback || balanced
+
+	modelRate := ""
+	if h.cfg.Upstream != nil {
+		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
+	}
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
@@ -620,7 +711,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// models.hidden 黑名单：点名调用直接拒绝，不打上游、不占选号。
 	// 与 /v1/models 的列表过滤对称（只藏列表不够，知道名字仍可硬调）。
-	if _, hide := h.loadLive().HiddenModels[realm+":"+bareModel]; hide {
+	//
+	// realm 为空表示「合池」（cross_realm 下两域都有该模型），此时必须查两域的
+	// 黑名单条目——拼接 realm+":"+bare 会得到 ":model" 这种永远匹配不上的键，
+	// 等于把黑名单在这条路径上关掉了。
+	if hide := h.modelHidden(realm, bareModel); hide {
 		writeOpenAIErrorHint(w, http.StatusBadRequest, "model_unavailable",
 			"model is hidden by gateway configuration, try another model", "")
 		st.status = http.StatusBadRequest
