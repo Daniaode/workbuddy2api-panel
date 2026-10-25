@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"sync"
@@ -1415,7 +1416,29 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if s := strings.TrimSpace(modelBlock.Reason); s != "" {
 			hint += "; upstream: " + s
 		}
+		// 状态码必须分两类，不能一律 400。判据见 ModelBlockStatus.Deterministic。
+		//
+		// 11102 / 11158（确定性拒绝）：400。等到期也不会恢复，客户端该换模型，
+		// 按可重试处理只会白转。
+		//
+		// 6004 等限流类：**503 + Retry-After**。上游明说了「稍后重置即可用」，
+		// 这是暂时不可用，不是请求错误。此前一律 400 的实测代价：单个模型一天
+		// 206 个 400，重试间隔中位数 12s、最短 1s——客户端把"稍后再试"读成了
+		// "你请求写错了"，却又因为不是终态而反复重试，日志被刷满，两个方向都错。
 		status = http.StatusBadRequest
+		if !modelBlock.Deterministic {
+			status = http.StatusServiceUnavailable
+			// Retry-After 只在有明确解封时刻时给：凭空编一个等待时长比不给更糟
+			// （客户端会严格按它退避，编错就是错等）。无 Until 时不带该头，
+			// 让客户端走自己的指数退避。
+			if !modelBlock.Until.IsZero() {
+				secs := int(time.Until(modelBlock.Until).Seconds())
+				if secs < 1 {
+					secs = 1
+				}
+				w.Header().Set("Retry-After", strconv.Itoa(secs))
+			}
+		}
 	}
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status

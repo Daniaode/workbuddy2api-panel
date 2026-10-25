@@ -370,6 +370,17 @@ type ModelBlockStatus struct {
 	Reason  string    // 冷却原因（通常为上游原文，如 "11102 model ... not found"）
 	Until   time.Time // 最早解封时间（零值 = 上游未给重置时刻）
 	Count   int       // 因此被挡的账号数
+	// Deterministic true = 挡住该模型的每一把锁都是上游**确定性拒绝**
+	// （11102 该后端无此模型 / 11158 账号类型无权）。这类锁不会随时间自愈，
+	// 等下去只会再撞同样的拒绝，调用方唯一有效的动作是换模型。
+	//
+	// 反之，只要有一把锁是**限流类**（6004 模型级限流等），本字段即为 false：
+	// 那类锁会到点自愈（6004 带上游重置墙钟），调用方等一会儿就能用。
+	//
+	// 为什么必须区分：两者此前共用同一个 400 响应，把「稍后重试即可」讲成了
+	// 「请求永久错误」。实测后果是客户端按不可重试错误处理却又反复重试——
+	// 单个模型一天刷出 206 个 400，重试间隔中位数 12s、最短 1s。
+	Deterministic bool
 }
 
 // ModelBlocked 报告该模型是否在全池范围内被模型级冷却挡住。
@@ -402,6 +413,9 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 	now := time.Now()
 
 	var st ModelBlockStatus
+	// allDeterministic 初值 true，遇到任何一把**非**确定性锁（限流类）就翻成 false。
+	// 语义是「每一把锁都是 11102/11158」才算确定性拒绝。
+	allDeterministic := true
 	for _, e := range p.byUID {
 		if realm != "" && e.a.Realm() != realm {
 			continue
@@ -420,6 +434,9 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 			if st.Reason == "" {
 				st.Reason = mc.Reason
 			}
+			if !isDeterministicReason(mc.Reason) {
+				allDeterministic = false
+			}
 			// 取最早解封：那才是"再等多久值得重试"的答案。
 			if !mc.Until.IsZero() && (st.Until.IsZero() || mc.Until.Before(st.Until)) {
 				st.Until = mc.Until
@@ -431,6 +448,12 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 		return ModelBlockStatus{}
 	}
 	st.Blocked = true
+	// 只有「每把锁都是确定性拒绝」才算不可自愈。
+	//
+	// 注意不能反过来写成「只要有一把是确定性就算」：混合场景（一个号 11158、
+	// 另一个号 6004）等 6004 到点就能恢复，对调用方而言仍是「等一会儿」。
+	// 报成不可重试会让他永远放弃这个模型。
+	st.Deterministic = allDeterministic
 	return st
 }
 
