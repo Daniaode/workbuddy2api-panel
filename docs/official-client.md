@@ -48,11 +48,11 @@ B 级文档看起来最权威（对方声称解包过安装包），但有两个
 
 | 项 | 官方真实值 | 出处 |
 |---|---|---|
-| 客户端版本 | **`5.8.3`** | `product.json` 的 `genieVersion`；安装包文件名 `...-5.8.3.41334564-...` |
-| CLI 版本 | **`2.161.0`** | `dist/codebuddy-lite-wb.mjs` 内 `publishConfig.customPackage = {name:"@tencent-ai/codebuddy-code", version:"2.161.0"}` |
+| 客户端版本 | **`5.9.2`** | `product.json` 的 `genieVersion`；安装包文件名 `...-5.9.2.42136757-...` |
+| CLI 版本 | **`2.165.0`** | `dist/codebuddy-lite-wb.mjs` 内 `publishConfig.customPackage = {name:"@tencent-ai/codebuddy-code", version:"2.165.0"}` |
 | `deploymentType` | `SaaS` | `product.json` |
 | `applicationName` / `productName` | `WorkBuddy` | `product.json` |
-| `commit` / `date` | `db0e9b51…` / `2026-10-15T01:58:12.880Z` | `product.json` |
+| `commit` / `date` | `0b5051be…` / `2026-10-24T08:44:37.992Z` | `product.json` |
 
 对应常量：`internal/upstream/headers.go` 的 `defaultClientVersion`、`defaultCliVersion`、`deploymentType`。
 
@@ -237,5 +237,6 @@ X-Root-Request-Id, X-Trace-Id, X-User-Id
 | 2026-10-24 | 25 处伪造 ID（`wb2api-*`）替换 | — |
 | 2026-10-24 | `X-Product` → `SaaS`（与 `X-IDE-*` 解耦） | `deploymentType` |
 | 2026-10-24 | UA `5.5.4` → `5.8.3`，CLI `2.137.1` → `2.161.0` | `product.json` + bundle `publishConfig` |
+| 2026-10-27 | UA `5.8.3` → `5.9.2`，CLI `2.161.0` → `2.165.0`；`desktop.go` 桌面指纹版本号从硬编码 5.5.6 改为复用 `defaultClientVersion`/`defaultCliVersion` 常量（此前 chat 出站已升 5.8.3，桌面行为上报仍停 5.5.6，不一致） | `product.json`（`5.9.2.42136757-0b5051be.exe` 解包）+ bundle `publishConfig` |
 | 2026-10-24 | `Accept-Language` 仅积分包查询发短值 `zh`/`en` | `fetchResourcePackagesPage` |
 | 2026-10-24 | 成长任务事件三处自造取值（任务名/模板 id/messageId）替换 | 官方 registry + 模板目录 |

@@ -16,21 +16,21 @@ const (
 	// defaultClientVersion 出站 WorkBuddy 客户端版本段（UA 的 `WorkBuddy/<ver>` 与
 	// X-IDE-Version）。
 	//
-	// 取值依据（A 级，官方 5.8.3 Windows 安装包）：
-	//   resources/app.asar.unpacked/cli/product.json 的 genieVersion = "5.8.3"；
-	//   安装包文件名 WorkBuddy-win32-x64-user-5.8.3.41334564-db0e9b51.exe；
-	//   product.json 的 commit = db0e9b51...、date = 2026-10-15。
+	// 取值依据（A 级，官方 5.9.2 Windows 安装包）：
+	//   resources/app.asar.unpacked/cli/product.json 的 genieVersion = "5.9.2"；
+	//   安装包文件名 WorkBuddy-win32-x64-user-5.9.2.42136757-0b5051be.exe；
+	//   product.json 的 commit = 0b5051be...、date = 2026-10-24。
 	//
 	// config upstream.client_version 可覆盖（空 = 内置默认）。
-	defaultClientVersion = "5.8.3"
+	defaultClientVersion = "5.9.2"
 	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。
 	//
 	// 取值依据（A 级，同一安装包）：内置 CLI 的 bundle 里
 	// publishConfig.customPackage.name = "@tencent-ai/codebuddy-code"，
-	// version = "2.161.0"。
+	// version = "2.165.0"。
 	//
 	// config upstream.cli_version 可覆盖（空 = 内置默认）。
-	defaultCliVersion = "2.161.0"
+	defaultCliVersion = "2.165.0"
 
 	// deploymentType 官方 product.json 的 deploymentType（两个安装包都是 SaaS），
 	// 由 ProductEndpointHttpInterceptor 作为 X-Product 加到每个请求上。
@@ -348,7 +348,7 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	conversationID := meta.ConversationID
 	if conversationID == "" {
 		// 官方 X-Conversation-ID 是**带连字符的 UUID v4**（36 位）。
-		// 依据（官方 5.8.3 Windows 安装包）：SessionImpl 构造函数里
+		// 依据（官方 5.9.2 Windows 安装包）：SessionImpl 构造函数里
 		// `this.id = generateUUUID()`，而 generateUUUID 的版本位是
 		// `i[6]=15&i[6]|64`（0x40 = 版本 4），返回值带连字符。
 		// 注意与轮次/消息 id 区分：那两者是 uuidv7 去连字符。

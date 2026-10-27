@@ -48,7 +48,7 @@ func ResolveConversationID(body []byte) string {
 
 // NewMessageID 生成对话消息级 32 位十六进制 ID（UUID v7 去连字符）。
 //
-// 依据（官方 5.8.3 安装包）：对话的 X-Conversation-Message-ID / X-Request-ID
+// 依据（官方 5.9.2 安装包）：对话的 X-Conversation-Message-ID / X-Request-ID
 // 都是 `uuidv7().replace(/-/g,"")`。非对话请求的 X-Request-ID 另用 v4，
 // 见 NewUUIDv4Hex。
 func NewMessageID() string { return NewUUIDv7Hex() }
