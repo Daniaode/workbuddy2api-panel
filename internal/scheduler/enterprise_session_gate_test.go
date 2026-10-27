@@ -11,8 +11,12 @@ import (
 )
 
 // sessionTestScheduler 与 enterpriseTestScheduler 同构：switched=true 时账号的
-// AccessToken 为带 token_source=enterprise_switch 的 JWT（企业**切换会话**，
-// enterpriseId 为空——网关无法凭 enterpriseId 识别的形态）；false 为个人号对照组。
+// AccessToken 为带**非空 enterprise_id** 的 JWT（企业切换会话——浏览器在企业空间
+// 状态下完成 OAuth 授权签发）；false 为个人号对照组。
+//
+// 判据是 enterprise_id 非空，而非 token_source=enterprise_switch：后者被实测证明
+// 不可靠（手机号注册的个人账号 s 也带该字段，但 enterprise_id 空、行为事件正常
+// 记账，见 auth.IsEnterpriseSession 注释）。
 func sessionTestScheduler(t *testing.T, switched bool) (*Scheduler, *recorderUpstream) {
 	t.Helper()
 	r := &recorderUpstream{}
@@ -21,7 +25,7 @@ func sessionTestScheduler(t *testing.T, switched bool) (*Scheduler, *recorderUps
 
 	token := "at"
 	if switched {
-		payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"u1","token_source":"enterprise_switch"}`))
+		payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"u1","enterprise_id":"ent-1"}`))
 		token = "hdr." + payload + ".sig"
 	}
 	a := &auth.Auth{UID: "u1", AccessToken: token, RefreshToken: "rt", ExpiresAt: 9999999999}
