@@ -637,7 +637,7 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	// （见 auth.IsEnterpriseSession）。
 	if a.IsEnterpriseSession() {
 		writeErr(w, http.StatusUnprocessableEntity,
-			"该账号为企业版/企业切换会话（token_source=enterprise_switch），无个人成长体系，成长任务行为事件会被上游忽略；请移除账号后以个人身份重新登录")
+			"该账号为企业版/企业上下文（enterprise_id 非空），无个人成长体系，成长任务行为事件会被上游忽略；请移除账号后以个人身份重新登录")
 		return
 	}
 	if a.IsGlobal() {
@@ -1297,7 +1297,7 @@ func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	// 单任务入口共用同一套动作，必须一并挡上（下游 fork 吸收本 PR 时发现的缺口）。
 	if a.IsEnterpriseSession() {
 		writeErr(w, http.StatusUnprocessableEntity,
-			"该账号为企业版/企业切换会话（token_source=enterprise_switch），无个人成长体系，成长任务行为事件会被上游忽略；请移除账号后以个人身份重新登录")
+			"该账号为企业版/企业上下文（enterprise_id 非空），无个人成长体系，成长任务行为事件会被上游忽略；请移除账号后以个人身份重新登录")
 		return
 	}
 	if a.IsGlobal() {

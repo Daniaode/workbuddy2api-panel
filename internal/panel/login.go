@@ -284,7 +284,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	// 成长任务全部无法点亮（签到/列表/额度/领养照常）。当场给出修复路径，
 	// 避免用户事后对着「已上报但进度 0/x」排查（见 auth.IsEnterpriseSession）。
 	if a.IsEnterpriseSession() && !a.IsEnterprise() {
-		log.Printf("panel: WARN uid=%s 的凭证为企业切换会话（token_source=enterprise_switch）：成长任务行为事件会被上游静默丢弃；建议移除该账号，在浏览器退出企业切换（个人身份）后重新登录", acct.UID)
+		log.Printf("panel: WARN uid=%s 的凭证为企业上下文（enterprise_id 非空）：成长任务行为事件会被上游静默丢弃；建议移除该账号，在浏览器退出企业切换（个人身份）后重新登录", acct.UID)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"done":            true,
