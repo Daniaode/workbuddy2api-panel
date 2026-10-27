@@ -29,6 +29,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -656,6 +657,10 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	}
 	act := autoActionFor(body.TaskCode)
 	if act == nil {
+		if strings.HasPrefix(body.TaskCode, "expert_use_") {
+			p.autoExpertUseTask(w, r, a, body.TaskCode)
+			return
+		}
 		writeErr(w, http.StatusNotImplemented,
 			"该任务需要客户端内交互（无对应接口），无法自动完成；请按任务说明在官方客户端操作")
 		return
@@ -1099,6 +1104,29 @@ func runExpertTeamUse(p *Panel, a *auth.Auth) (string, error) {
 	return runExpertBatch(p, a, "team", 3)
 }
 
+// summonAndUseExpert 对单个专家完成「召唤链 → 真实 chat → expert_actual_use」。
+// expert_actual_use 的 requestId 必须是服务端真实 id（DesktopChatWithExpert 解析），
+// 自造 UUID 不计数。expert_5 / expert_use_* 两类任务共用。
+func summonAndUseExpert(p *Panel, a *auth.Auth, e upstream.MarketExpert) error {
+	// 召唤链（web_element_click + summon_click + summoned）。
+	summonEvents := upstream.DesktopExpertSummonSequence(e)
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, summonEvents...); err != nil {
+		return fmt.Errorf("召唤链: %w", err)
+	}
+	// 真实 chat（带 X-Expert-Id）→ 服务端 requestId。
+	conv, req, err := p.cfg.Upstream.DesktopChatWithExpert(a, e.ExpertID)
+	if err != nil {
+		return fmt.Errorf("真实对话: %w", err)
+	}
+	// 使用事件（JOIN 服务端 requestId）+ chat 链。
+	events := append(upstream.DesktopChatSequence(conv, req, session.NewUUIDv7Hex(), "fast-model", "fast-model"),
+		upstream.DesktopExpertActualUseEvent(e, conv, req))
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+		return fmt.Errorf("使用事件: %w", err)
+	}
+	return nil
+}
+
 // runExpertBatch 专家召唤+使用的公共实现。失败逐个继续，返回汇总信息。
 func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (string, error) {
 	experts, err := p.cfg.Upstream.MarketExpertList(a, expertType)
@@ -1113,22 +1141,7 @@ func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (strin
 		if ok >= count {
 			break
 		}
-		// 召唤链（web_element_click + summon_click + summoned）。
-		summonEvents := upstream.DesktopExpertSummonSequence(e)
-		if err := p.cfg.Upstream.ReportDesktopEvent(a, summonEvents...); err != nil {
-			fail++
-			continue
-		}
-		// 真实 chat（带 X-Expert-Id）→ 服务端 requestId。
-		conv, req, cerr := p.cfg.Upstream.DesktopChatWithExpert(a, e.ExpertID)
-		if cerr != nil {
-			fail++
-			continue
-		}
-		// 使用事件（JOIN 服务端 requestId）+ chat 链。
-		events := append(upstream.DesktopChatSequence(conv, req, session.NewUUIDv7Hex(), "fast-model", "fast-model"),
-			upstream.DesktopExpertActualUseEvent(e, conv, req))
-		if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+		if err := summonAndUseExpert(p, a, e); err != nil {
 			fail++
 			continue
 		}
@@ -1139,6 +1152,61 @@ func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (strin
 	}
 	_ = fail
 	return fmt.Sprintf("已对 %d 位真实专家完成召唤+使用链（类型 %s）", ok, expertType), nil
+}
+
+// expertIDJumpRe 从 jump_url 提取 expertId 参数（兼容 URL 编码 %3D 与已解码 = 两种形态）。
+var expertIDJumpRe = regexp.MustCompile(`expertId(?:%3D|=)([A-Za-z0-9_]+)`)
+
+// expertNameTitleRe 从「体验「专家名」」式 title 提取中文专家名（作 keyword 搜索用）。
+var expertNameTitleRe = regexp.MustCompile(`「([^」]+)」`)
+
+// parseExpertIDFromJumpURL 解析任务 jump_url 里的 expert_id（ex_xxx）。
+func parseExpertIDFromJumpURL(jumpURL string) string {
+	m := expertIDJumpRe.FindStringSubmatch(jumpURL)
+	if len(m) > 1 {
+		return m[1]
+	}
+	return ""
+}
+
+// expertNameFromTitle 从任务 title 提取专家中文名（keyword 搜索用）。
+func expertNameFromTitle(title string) string {
+	if m := expertNameTitleRe.FindStringSubmatch(title); len(m) > 1 {
+		return m[1]
+	}
+	return strings.TrimSpace(strings.TrimPrefix(title, "体验"))
+}
+
+// runExpertSpecific 完成 expert_use_*「体验指定专家」任务。
+//
+// 判据与 expert_5 同源（expert_actual_use），但要求**指定** expert_id——任务 jump_url
+// 里写死 ex_xxx。专家市场列表不支持按 id 过滤，改用 title 中文名 keyword 搜索，
+// 再按 expert_id 精确匹配（实测四任务「直播电商教练/抖音策略师/中国电商运营专家/
+// 商家宣传页与海报设计师」均能精确命中）。
+func runExpertSpecific(p *Panel, a *auth.Auth, task upstream.Task) (string, error) {
+	expertID := parseExpertIDFromJumpURL(task.JumpURL)
+	if expertID == "" {
+		return "", fmt.Errorf("jump_url 未含 expertId（%s）", task.JumpURL)
+	}
+	name := expertNameFromTitle(task.Title)
+	experts, err := p.cfg.Upstream.MarketExpertSearch(a, name)
+	if err != nil {
+		return "", fmt.Errorf("搜索专家: %w", err)
+	}
+	var target *upstream.MarketExpert
+	for i := range experts {
+		if experts[i].ExpertID == expertID {
+			target = &experts[i]
+			break
+		}
+	}
+	if target == nil {
+		return "", fmt.Errorf("专家 %s 不在搜索结果（keyword=%q，共 %d 条）", expertID, name, len(experts))
+	}
+	if err := summonAndUseExpert(p, a, *target); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("已召唤并使用专家 %s（%s）", target.DisplayNameZH, target.ProfessionZH), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1282,10 +1350,128 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 		out = append(out, item)
 		time.Sleep(reportGap) // 项间节流
 	}
+
+	// 阶段 N：动态 expert_use_*「体验指定专家」任务（autoActions 静态表之外）。
+	//
+	// 上游随运营新增不同专家（直播电商教练/抖音策略师/中国电商运营专家/商家宣传
+	// 页与海报设计师…），任务码是 expert_use_<专家slug>，无法静态枚举。这里扫描
+	// 任务列表，凡 expert_use_ 前缀且未完成的，走「解析 jump_url 的 expert_id →
+	// title 中文名 keyword 搜索 → 召唤+真实对话+expert_actual_use」链，与 expert_5
+	// 同判据（见 runExpertSpecific）。
+	//
+	// 已完成（claimed 或 current>=target）直接跳过；达标未领的补领（claim 幂等）。
+	if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
+		for _, t := range tasks {
+			if !strings.HasPrefix(t.TaskCode, "expert_use_") {
+				continue
+			}
+			item := map[string]any{"task_code": t.TaskCode, "desc": "体验指定专家：" + t.Title}
+			if t.Claimed || (t.Current >= t.Target && t.Target > 0) {
+				item["status"] = "skipped"
+				msg := "已完成（" + taskProgressText(&t) + "）"
+				if !t.Claimed {
+					if credit, energy, cerr := claimTaskReward(p, a, t.TaskCode); cerr == nil {
+						if credit > 0 || energy > 0 {
+							msg += fmt.Sprintf("；已补领 +%d 分 +%d 能", credit, energy)
+						}
+					}
+				}
+				item["message"] = msg
+				out = append(out, item)
+				continue
+			}
+			msg, err := runExpertSpecific(p, a, t)
+			if err != nil {
+				item["status"] = "error"
+				item["message"] = err.Error()
+				out = append(out, item)
+				continue
+			}
+			after, _ := p.taskByCodeWaiting(a, t.TaskCode)
+			item["status"] = "done"
+			item["message"] = msg
+			item["progress_after"] = taskProgressText(after)
+			if after != nil && after.Claimable {
+				item["claimable"] = true
+				credit, energy, cerr := claimTaskReward(p, a, t.TaskCode)
+				if cerr == nil {
+					item["claimed"] = true
+					item["credit"] = credit
+					item["energy"] = energy
+					if credit > 0 || energy > 0 {
+						item["message"] = msg + fmt.Sprintf("；已自动领奖 +%d 分 +%d 能", credit, energy)
+					} else {
+						item["message"] = msg + "；奖励此前已领取"
+					}
+				} else {
+					item["claim_error"] = cerr.Error()
+					item["message"] = msg + "；达标但领奖失败（可在列表手动重试）"
+				}
+			}
+			out = append(out, item)
+			time.Sleep(reportGap)
+		}
+	}
 	return out
 }
 
 // accountTaskAutoAll 一键完成该账号全部可自动任务。
+// autoExpertUseTask 单任务入口的 expert_use_*「体验指定专家」处理。
+//
+// expert_use_* 任务码是上游随运营动态下发的（专家 slug 无法静态枚举），autoActionFor
+// 查不到静态表。这里复用 runExpertSpecific 走「解析 expert_id → keyword 搜索 →
+// 召唤+真实对话+expert_actual_use」链，回读达标即自动领奖（与 accountTaskAuto 同口径）。
+func (p *Panel) autoExpertUseTask(w http.ResponseWriter, r *http.Request, a *auth.Auth, taskCode string) {
+	if !p.tryLockAccount(a.UID) {
+		writeErr(w, http.StatusConflict, "该账号有任务动作正在执行中，请等本轮结束后再试")
+		return
+	}
+	defer p.unlockAccount(a.UID)
+	task, err := p.taskByCode(a, taskCode)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
+		return
+	}
+	if task == nil {
+		writeErr(w, http.StatusNotFound, "该账号没有此任务")
+		return
+	}
+	if task.Claimed {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "skipped": true, "message": "该任务已领取过奖励"})
+		return
+	}
+	msg, err := runExpertSpecific(p, a, *task)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "执行失败: "+err.Error())
+		return
+	}
+	after, _ := p.taskByCodeWaiting(a, taskCode)
+	claimable := after != nil && after.Claimable
+	resp := map[string]any{
+		"ok": true, "message": msg,
+		"progress_after": taskProgressText(after), "claimable": claimable,
+	}
+	if claimable {
+		credit, energy, cerr := claimTaskReward(p, a, taskCode)
+		if cerr == nil {
+			resp["claimed"] = true
+			resp["credit"] = credit
+			resp["energy"] = energy
+			if credit > 0 || energy > 0 {
+				resp["message"] = msg + fmt.Sprintf("；已自动领奖 +%d 分 +%d 能", credit, energy)
+			} else {
+				resp["message"] = msg + "；奖励此前已领取"
+			}
+		} else {
+			resp["claim_error"] = cerr.Error()
+			resp["message"] = msg + "；达标但领奖失败，可在任务列表手动点「领取」重试"
+		}
+	}
+	log.Printf("panel: 专家使用任务 uid=%s code=%s progress %s -> %s claimable=%v",
+		a.UID, taskCode, taskProgressText(task), taskProgressText(after), claimable)
+	writeJSON(w, http.StatusOK, resp)
+}
+
 func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.accountByUID(w, uid)

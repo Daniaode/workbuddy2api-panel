@@ -378,13 +378,10 @@ type MarketExpert struct {
 	Categories    []any  `json:"categories"`
 }
 
-// MarketExpertList 拉取专家市场真实专家列表（expertType: "agent" 单专家 / "team" 专家团）。
-// expert_actual_use 的判据校验要求 id 是平台上真实存在的专家（编造 id 不计数）。
-func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpert, error) {
-	body := map[string]any{"page": 1, "page_size": 20, "sort_by": "reco_rank", "sort_order": "desc"}
-	if expertType != "" {
-		body["expert_type"] = expertType
-	}
+// doMarketExpertList 专家市场查询公共实现（MarketExpertList / MarketExpertSearch 共用）。
+// 端点 /portal/operation-platform/market/expert/list，body 可带 keyword（中文专家名）
+// 与 expert_type 过滤。响应信封由 doJSON 解，data 顶层含 experts[]。
+func (c *Client) doMarketExpertList(a *auth.Auth, body map[string]any) ([]MarketExpert, error) {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -412,6 +409,28 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 		return nil, fmt.Errorf("expert list parse: %w", err)
 	}
 	return out.Experts, nil
+}
+
+// MarketExpertList 拉取专家市场真实专家列表（expertType: "agent" 单专家 / "team" 专家团）。
+// expert_actual_use 的判据校验要求 id 是平台上真实存在的专家（编造 id 不计数）。
+func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpert, error) {
+	body := map[string]any{"page": 1, "page_size": 20, "sort_by": "reco_rank", "sort_order": "desc"}
+	if expertType != "" {
+		body["expert_type"] = expertType
+	}
+	return c.doMarketExpertList(a, body)
+}
+
+// MarketExpertSearch 按中文关键词搜索专家市场（keyword 传专家中文名，如「直播电商教练」）。
+//
+// 用于 expert_use_*「体验指定专家」任务：任务 jump_url 里带 expertId=ex_xxx，但专家
+// 市场列表**不支持按 expert_id 过滤**，只支持 keyword 搜索——用任务 title 里的中文名
+// 搜出候选，再按 expert_id 精确匹配（实测「直播电商教练/抖音策略师/中国电商运营专家/
+// 商家宣传页与海报设计师」四任务均能精确命中，且拿到 display_name/profession/version
+// 完整字段）。
+func (c *Client) MarketExpertSearch(a *auth.Auth, keyword string) ([]MarketExpert, error) {
+	body := map[string]any{"page": 1, "page_size": 50, "keyword": keyword, "expert_type": "agent"}
+	return c.doMarketExpertList(a, body)
 }
 
 // DesktopChatWithExpert 发一条真实桌面指纹 chat 请求（可带 X-Expert-Id），从 SSE 流
