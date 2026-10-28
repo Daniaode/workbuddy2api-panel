@@ -9,7 +9,7 @@
   },
   "panel": {
     "package_detail_limit": 5,
-    "avail_probe_interval": "30m"
+    "avail_probe_interval": "12h"
   },
   "logging": {
     "request_archive_enabled": true,

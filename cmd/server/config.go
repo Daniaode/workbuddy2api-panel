@@ -310,7 +310,7 @@ func Default() *Config {
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.ReadTimeout = "300s"
 	c.Panel.PackageDetailLimit = 5
-	c.Panel.AvailProbeInterval = "30m"
+	c.Panel.AvailProbeInterval = "12h"
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
 	c.Logging.RequestArchiveMaxMB = 100
@@ -604,7 +604,7 @@ func (c *Config) normalize() error {
 	// 模型可用性自动探测间隔：空值回落默认 30m；"0" 合法（关闭自动探测，
 	// 只保留面板手动按钮）；负值钳 0（无"负间隔"语义）。
 	if c.Panel.AvailProbeInterval == "" {
-		c.Panel.AvailProbeInterval = "30m"
+		c.Panel.AvailProbeInterval = "12h"
 	}
 	if c.AvailProbeIntervalDur, err = time.ParseDuration(c.Panel.AvailProbeInterval); err != nil {
 		return fmt.Errorf("panel.avail_probe_interval: %w", err)
