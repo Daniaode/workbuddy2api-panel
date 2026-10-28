@@ -107,3 +107,55 @@ func TestAvailProbeDailyRequestBudget(t *testing.T) {
 	t.Logf("默认配置：TTL=%s，全量重探每 %.1fh，日均约 %.0f 请求（上限 %d）",
 		ttl, ttl.Hours(), perDay, budget)
 }
+
+// denied / missing 是账号级确定性事实，必须用超长 TTL，避免反复「试无权模型」。
+//
+// 回归背景（2026-10-28）：两个国际号被上游 11140「账号存在异常行为，已被限制」
+// 封禁。同时段 CN 账号 token 用量高 6 倍却全部正常——差别在于可用性探测**只打
+// global 模型**，且每 6h 把 14 个 denied(11158 无权) + 3 个 missing(11102 不存在)
+// 模型重试一遍。在风控看来这就是脚本在扫权限，是封禁的直接原因。
+func TestAvailLevelTTLKeepsDeterministicVerdicts(t *testing.T) {
+	var p Panel
+	p.availInterval.Store(int64(12 * time.Hour))
+	normal := p.availTTL()
+
+	// 确定性结论：30 天，远长于常规 TTL。
+	for _, level := range []string{"denied", "missing"} {
+		got := p.availLevelTTL(level)
+		if got != availTTLDeterministic {
+			t.Errorf("level=%s: availLevelTTL()=%s want %s（确定性拒绝不得按常规 TTL 重探）",
+				level, got, availTTLDeterministic)
+		}
+		if got <= normal {
+			t.Errorf("level=%s: 确定性 TTL(%s) 必须显著大于常规 TTL(%s)，否则会反复试无权模型",
+				level, got, normal)
+		}
+	}
+
+	// 其余状态照常跟随探测间隔。
+	for _, level := range []string{"ok", "limited", "error"} {
+		if got := p.availLevelTTL(level); got != normal {
+			t.Errorf("level=%s: availLevelTTL()=%s want %s（非确定性状态应跟随间隔）", level, got, normal)
+		}
+	}
+}
+
+// 30 天的实际效果：一条 6 小时前的 denied 记录必须仍然有效（不触发重探）。
+func TestDeniedEntrySurvivesNormalTTLWindow(t *testing.T) {
+	var p Panel
+	p.availInterval.Store(int64(12 * time.Hour))
+
+	sixHoursAgo := time.Now().Add(-6 * time.Hour)
+	// 常规 TTL 下这条已过期（6h 下限 → 12h×3=36h，实际未过期）。
+	// 关键断言是：denied 走 30 天档，无论间隔怎么配都不会在 6h 后失效。
+	if age := time.Since(sixHoursAgo); age > p.availLevelTTL("denied") {
+		t.Fatalf("6h 前的 denied 记录已过期（TTL=%s），会导致重探无权模型", p.availLevelTTL("denied"))
+	}
+
+	// 极端配置：间隔拉到 24h 时，常规 TTL 也该是 24h（钳上限），
+	// 但 denied 仍是 30 天。
+	p.availInterval.Store(int64(24 * time.Hour))
+	if got := p.availLevelTTL("denied"); got != availTTLDeterministic {
+		t.Errorf("间隔 24h 时 denied TTL=%s，应恒为 %s", got, availTTLDeterministic)
+	}
+}

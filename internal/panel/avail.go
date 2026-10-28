@@ -57,6 +57,31 @@ const availTTLManual = 24 * time.Hour
 // 折算 140 请求/天（约 5.8 个/小时），与正常对话流量同一个量级，不显眼。
 const availTTLFloor = 6 * time.Hour
 
+// availTTLDeterministic 确定性拒绝结论的保留时长（denied / missing）。
+//
+// 为什么必须单独一档、而且必须很长：
+//
+//	上游风控是按「异常调用形态」判定账号的。反复用某个账号去试它**无权使用**的
+//	模型（11158「账号类型不支持」）或在目录里**不存在**的模型（11102），在风控
+//	看来就是脚本在扫权限——这正是 2026-10-28 两个国际号被 11140
+//	「账号存在异常行为，已被限制」封禁的直接原因（同一时段 CN 账号 token 用量
+//	高 6 倍却全部正常，因为探测只打 global 模型）。
+//
+//	denied / missing 是**账号级确定事实**，不会因为时间流逝而变化。按 6h 的常规
+//	TTL 每轮重探，等于每天几十次「再试一次无权模型」，纯属自残。
+//
+//	取 30 天：模型上下架/权限调整是月级事件；真要立刻刷新，面板有手动「探测
+//	可用性」按钮（全量重探一次）。宁可偶尔显示旧结论，也不能拿账号去换新鲜度。
+const availTTLDeterministic = 30 * 24 * time.Hour
+
+// availLevelTTL 单个条目的实际过期时长：确定性拒绝走 30 天，其余走常规 TTL。
+func (p *Panel) availLevelTTL(level string) time.Duration {
+	if level == "denied" || level == "missing" {
+		return availTTLDeterministic
+	}
+	return p.availTTL()
+}
+
 // availTTL 探测结果的实际保留时长。
 //
 //	自动探测开启时不能再用固定 24h：间隔 30m 意味着每半小时就有新证据，若仍按
@@ -132,7 +157,12 @@ func (p *Panel) loadAvail(now time.Time) map[string]AvailEntry {
 		return out
 	}
 	for _, e := range f.Entries {
-		if e.Model == "" || now.Sub(e.CheckedAt) > p.availTTL() {
+		if e.Model == "" {
+			continue
+		}
+		// 按 level 分级过期：denied/missing 是确定性事实，30 天内不再重探，
+		// 避免反复「试无权模型」被上游风控判定为异常调用（见 availTTLDeterministic）。
+		if now.Sub(e.CheckedAt) > p.availLevelTTL(e.Level) {
 			continue
 		}
 		out[e.Model] = e
