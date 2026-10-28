@@ -461,6 +461,11 @@ function renderAccounts(list) {
         ((s.enterprise || s.realm === 'global') ? '' :
           '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
+        // 只读探活：仅国际版账号渲染。用最轻的余额端点判断上游是否已解封，
+        // 全程不改池状态——被 11140 封禁时点「解冻」会让它立刻重新选号并再撞一次。
+        (s.realm === 'global'
+          ? '<button class="xs ghost" data-a="probe_ban" data-u="' + esc(s.uid) + '" title="只读探活：用余额端点判断上游是否已解封，不改动池状态">探活</button>'
+          : '') +
         (s.enterprise ? '' :
           '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
@@ -636,6 +641,19 @@ $('accBody').addEventListener('click', async ev => {
     } else if (a === 'resume') {
       await api('accounts/' + encodeURIComponent(u) + '/resume', { method: 'POST' });
       toast('已恢复选号', 'ok');
+    } else if (a === 'probe_ban') {
+      // 只读探活：四类结论各有不同下一步动作，必须分别提示——
+      // 把「仍封禁」显示成「已恢复」会让用户解冻后立刻再撞 11140。
+      const r = await api('accounts/' + encodeURIComponent(u) + '/probe_ban', { method: 'POST' });
+      const map = {
+        lifted: ['上游已解封，可点「解冻」恢复选号', 'ok'],
+        still_banned: ['仍被上游限制（11140），需官方申诉', 'err'],
+        blocked: ['会话仍活但被拦（非封禁），稍后再试', 'warn'],
+        session_dead: ['登录态失效，需重新登录', 'err'],
+        inconclusive: ['无法判定（网络/限流），稍后再试', 'warn'],
+      };
+      const [msg, kind] = map[r.verdict] || ['探活结果：' + r.verdict, 'warn'];
+      toast(msg + (r.detail ? '（' + r.detail + '）' : ''), kind);
     } else if (a === 'tasks') {
       openTasks(u);
     } else if (a === 'remove') {

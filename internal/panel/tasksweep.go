@@ -25,6 +25,7 @@ package panel
 import (
 	"log"
 	"sync"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
@@ -58,6 +59,14 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 		wg.Add(1)
 		go func(a *auth.Auth, uid string) {
 			defer wg.Done()
+			// 账号摊开：本轮各号起点错开，避免「同一秒全池并发」的机械指纹。
+			// 清扫是分钟级低频任务，几秒的错开不影响时效，却把「齐射」打散成
+			// 真人式的先后活动（见 scheduler/humanize.go 的风控背景）。
+			if p.cfg.Scheduler != nil {
+				if d := p.cfg.Scheduler.AccountSpread(uid); d > 0 {
+					time.Sleep(d)
+				}
+			}
 			r := p.sweepAccount(a, uid)
 			mu.Lock()
 			defer mu.Unlock()

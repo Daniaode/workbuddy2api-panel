@@ -66,6 +66,17 @@ type Config struct {
 	// 的任务奖励领掉，不跑任何行为链路）。与 GrowthHook 同款延迟挂载；nil 时
 	// ticker 到点跳过。见 issue #174：成长队列与「一键完成」都不负责这条补领链路。
 	TaskSweepHook func()
+
+	// BalanceJitterPermill / SweepJitterPermill 周期任务的节拍抖动（千分比，0 = 关闭）。
+	//
+	// 为什么需要：上游风控按「机械节拍」识别脚本——余额刷新精确每 5 分钟整点、
+	// 补领清扫精确每 15 分钟整点，全池账号在同一秒并发齐射。真人不会这样活动。
+	// 2026-10-24 竞品仓库复盘与 2026-10-28 本项目实测都是这个死法
+	// （11140「账号存在异常行为」集中封禁）。
+	//
+	// 0 = 完全保持旧行为（精确间隔、同时并发），老配置零回归。
+	BalanceJitterPermill int64
+	SweepJitterPermill   int64
 }
 
 // Scheduler 调度器。
@@ -97,6 +108,16 @@ type Scheduler struct {
 	// 供面板「到期提醒」标注数据年龄：卡片展示的是这份快照，必须让年龄可读，
 	// 否则界面 5 秒轮询会让人误以为数据也是 5 秒级新鲜。
 	lastBalanceRefresh atomic.Int64
+
+	// balanceJitter / sweepJitter 周期任务节拍抖动的千分比（0 = 关闭）。
+	// 与 balanceInterval 同款 atomic：面板保存配置后热生效，下一轮即按新值抖动。
+	balanceJitter atomic.Int64
+	sweepJitter   atomic.Int64
+
+	// balanceRound / sweepRound 已执行的周期轮次，作为抖动哈希的轮次种子。
+	// 每轮自增，保证相邻两轮的偏移不同（否则就是「每轮固定偏移」的假抖动）。
+	balanceRound atomic.Int64
+	sweepRound   atomic.Int64
 }
 
 // New 构建。
@@ -116,13 +137,48 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.BlackcatHours) == 0 {
 		cfg.BlackcatHours = []int{23}
 	}
-	return &Scheduler{
+	s := &Scheduler{
 		cfg:           cfg,
 		adoptTried:    make(map[string]string),
 		rearmSchedule: make(chan struct{}, 1),
 		rearmBalance:  make(chan struct{}, 1),
 		rearmSweep:    make(chan struct{}, 1),
 	}
+	s.balanceJitter.Store(clampPermill(cfg.BalanceJitterPermill))
+	s.sweepJitter.Store(clampPermill(cfg.SweepJitterPermill))
+	return s
+}
+
+// clampPermill 把抖动千分比钳到 [0, jitterPermillRange]。
+// 负值视同关闭（1 个字节的配置手误不该改变调度语义）。
+func clampPermill(v int64) int64 {
+	if v <= 0 {
+		return 0
+	}
+	if v > jitterPermillRange {
+		return jitterPermillRange
+	}
+	return v
+}
+
+// SetBalanceJitter 热改余额刷新抖动（千分比，0 = 关闭）。
+func (s *Scheduler) SetBalanceJitter(permill int64) {
+	s.balanceJitter.Store(clampPermill(permill))
+	poke(s.rearmBalance)
+}
+
+// SetSweepJitter 热改补领清扫抖动（千分比，0 = 关闭）。
+func (s *Scheduler) SetSweepJitter(permill int64) {
+	s.sweepJitter.Store(clampPermill(permill))
+	poke(s.rearmSweep)
+}
+
+// AccountSpread 返回某账号在本轮批量动作里应额外等待的时长（0 = 不等待）。
+//
+// 供 panel 侧并发逐号的批量动作（任务补领清扫）复用同一套摊开口径，
+// 避免「同一秒全池并发」的机械指纹。抖动未开启时恒返回 0，旧行为不变。
+func (s *Scheduler) AccountSpread(uid string) time.Duration {
+	return accountOffset(uid, s.sweepJitter.Load(), s.sweepRound.Load())
 }
 
 // ExpiringSoonWindow 返回当前快过期路由窗口（读取时与热配置写在 schedMu 下同步）。
@@ -654,6 +710,10 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 	var wg sync.WaitGroup
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
+	// 账号摊开：同一轮里各号起点错开，消除「同一秒全池并发齐射」。
+	// permill=0 时 offset 恒为 0，旧行为逐字不变。
+	spreadPermill := s.balanceJitter.Load()
+	spreadRound := s.balanceRound.Load()
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
 			continue
@@ -665,6 +725,9 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		wg.Add(1)
 		go func(a *auth.Auth, uid string) {
 			defer wg.Done()
+			if d := accountOffset(uid, spreadPermill, spreadRound); d > 0 {
+				time.Sleep(d)
+			}
 			remain, total, expiring, earliestAt, earliestRemaining, buckets, err := s.cfg.Upstream.UserResourceSnapshot(a, expiringSoon)
 			if err != nil {
 				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
@@ -715,7 +778,11 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 					continue
 				}
 			}
-			timer := time.NewTimer(cur)
+			// 节拍抖动：permill=0 时 wait==cur，与旧行为逐字一致。
+			// 打开后每轮在 ±permill/1000 内偏移，不再是「精确每 5 分钟整点」的
+			// 机械打卡（见 humanize.go 的风控背景）。
+			wait := jitterDuration(cur, s.balanceJitter.Load(), "balance", s.balanceRound.Add(1))
+			timer := time.NewTimer(wait)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
@@ -758,7 +825,9 @@ func (s *Scheduler) StartTaskSweep(ctx context.Context, interval time.Duration) 
 					continue
 				}
 			}
-			timer := time.NewTimer(cur)
+			// 节拍抖动：permill=0 时 wait==cur，旧行为逐字不变。
+			wait := jitterDuration(cur, s.sweepJitter.Load(), "sweep", s.sweepRound.Add(1))
+			timer := time.NewTimer(wait)
 			select {
 			case <-ctx.Done():
 				timer.Stop()

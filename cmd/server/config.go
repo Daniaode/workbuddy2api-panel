@@ -130,6 +130,22 @@ type Config struct {
 		// 只做 accept/claim 两条幂等请求，不跑任何行为链路；分钟级开销可忽略。
 		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
 		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
+
+		// 周期任务「人味化」抖动（千分比，0–500）。缺省 0 = 完全保持旧行为。
+		//
+		// 为什么需要：上游风控按「机械节拍」识别脚本。改动前余额刷新是精确每 5
+		// 分钟整点、补领清扫精确每 15 分钟整点，且**全池账号在同一秒并发齐射**。
+		// 真人不会这样活动——2026-10-24 竞品仓库 6 个账号 3 分钟内被 11140
+		// 「账号存在异常行为」集中封禁，复盘结论就是这种机械节拍；本项目
+		// 2026-10-28 两个国际号同样被封，形态一致。
+		//
+		// 打开后：
+		//   1) 每轮执行时刻在 ±permill/1000 内偏移（不再是整点打卡）
+		//   2) 同一轮里各账号动作起点错开（不再同一秒全池齐射）
+		//
+		// 建议 250（±25%）。超过 500 拒绝（会改变调度语义而非微调）。
+		BalanceRefreshJitterPermill int64 `json:"balance_refresh_jitter_permill"`
+		TaskSweepJitterPermill      int64 `json:"task_sweep_jitter_permill"`
 	} `json:"schedule"`
 
 	Global struct {
@@ -687,6 +703,21 @@ func (c *Config) normalize() error {
 			c.Schedule.TaskSweepMinutes = 15
 		}
 		c.TaskSweepInterval = time.Duration(c.Schedule.TaskSweepMinutes) * time.Minute
+	}
+	// 节拍抖动：0–500 千分比；超限 fail fast，不静默钳制。
+	//
+	// 静默钳制会让用户以为「我设的 800 生效了」——实际是 500，抖动幅度对不上，
+	// 排查时又看不到任何提示。负值视同 0（关闭），这是唯一的宽容。
+	for name, v := range map[string]int64{
+		"schedule.balance_refresh_jitter_permill": c.Schedule.BalanceRefreshJitterPermill,
+		"schedule.task_sweep_jitter_permill":      c.Schedule.TaskSweepJitterPermill,
+	} {
+		if v < 0 {
+			return fmt.Errorf("%s: 负值 %d 无意义（0 = 关闭抖动）", name, v)
+		}
+		if v > 500 {
+			return fmt.Errorf("%s: %d 超出上限 500（超过 500‰ 会改变调度语义而非微调）", name, v)
+		}
 	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err

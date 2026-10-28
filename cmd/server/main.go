@@ -207,6 +207,9 @@ func main() {
 		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
+		// 周期任务节拍抖动（千分比，0 = 关闭）。削弱「整点 + 全池并发」的机器人指纹。
+		BalanceJitterPermill: cfg.Schedule.BalanceRefreshJitterPermill,
+		SweepJitterPermill:   cfg.Schedule.TaskSweepJitterPermill,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -560,6 +563,9 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		!newCfg.Schedule.GrowthEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
+	// 节拍抖动热生效：保存配置后下一轮即按新幅度抖动。
+	sch.SetBalanceJitter(newCfg.Schedule.BalanceRefreshJitterPermill)
+	sch.SetSweepJitter(newCfg.Schedule.TaskSweepJitterPermill)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 	// 模型可用性探测间隔：定时器每轮重读该值，改完下一轮生效（0 = 暂停）。
 	for _, pn := range panels {

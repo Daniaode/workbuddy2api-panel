@@ -182,6 +182,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
+	// 只读封禁探活（仅国际版）：用最轻的余额端点判断上游是否已解封，
+	// 全程不改池状态（解冻会让账号立刻重新选号并再撞一次 11140）。
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/probe_ban", p.withAuth(p.accountProbeBan))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.accountPause))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.withAuth(p.accountResume))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
