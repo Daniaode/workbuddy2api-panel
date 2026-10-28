@@ -379,11 +379,27 @@ func (p *Panel) StartAvailProbe(ctx context.Context, interval time.Duration) {
 				log.Printf("panel: 模型可用性自动探测每 %s", cur)
 				logged = cur
 			}
+			// 0 = 暂停：阻塞等待重新启用（或退出），绝不建零长 timer。
+			//
+			// 零长 timer 会立刻触发，下一轮又读到 0 —— 变成对上游模型目录的紧循环。
+			// 这条分支是「热改成 0」时的唯一正确出路。
+			if cur <= 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-p.availRearm:
+					continue
+				}
+			}
 			timer := time.NewTimer(cur)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
 				return
+			case <-p.availRearm:
+				// 间隔被热改：立刻按新值重排，不傻等旧 timer 到点。
+				timer.Stop()
+				continue
 			case <-timer.C:
 				p.probeOnceLogged("schedule")
 			}
@@ -416,6 +432,16 @@ func (p *Panel) probeOnceLogged(trigger string) (bool, error) {
 // SetAvailProbeInterval 热改探测间隔（下一轮生效；0 = 暂停）。
 func (p *Panel) SetAvailProbeInterval(d time.Duration) {
 	p.availInterval.Store(int64(d))
+	// 唤醒后台循环立即按新值重排。
+	//
+	// 不唤醒的后果：把 12h 改成 0（暂停）后，循环还阻塞在 12h 的 timer 上，
+	// 要等半天才读新值；更糟的是读到 0 后若无专门的「暂停」分支，会建零长
+	// timer 变成紧循环。两次事故（改小间隔不生效、改成 0 反而高频）都由此而来。
+	// 非阻塞发送：通道容量 1，循环没在等时丢弃即可（它下次读到的就是新值）。
+	select {
+	case p.availRearm <- struct{}{}:
+	default:
+	}
 }
 
 // probeBody 构造探测请求体。

@@ -159,3 +159,65 @@ func TestDeniedEntrySurvivesNormalTTLWindow(t *testing.T) {
 		t.Errorf("间隔 24h 时 denied TTL=%s，应恒为 %s", got, availTTLDeterministic)
 	}
 }
+
+// 把探测间隔热改为 0（暂停）后，后台循环必须阻塞等待唤醒，不能变成紧循环。
+//
+// 回归背景：早先只做了 availInterval.Store(d)，没有唤醒通道。把 12h 改成 0 时
+// 循环还阻塞在旧的 12h timer 上；等它到点读到 0 后，time.NewTimer(0) 立刻触发，
+// 下一轮又读到 0 —— 对上游模型目录变成秒级紧循环。这类「配置改成保守值反而更
+// 激进」的缺陷在风控敏感场景下代价很大。
+func TestSetAvailProbeIntervalRearm(t *testing.T) {
+	p := New(Config{})
+	if p.availRearm == nil {
+		t.Fatal("availRearm 未初始化：热改间隔不会唤醒后台循环")
+	}
+
+	// 热改一次应产生一条唤醒通知。
+	p.SetAvailProbeInterval(12 * time.Hour)
+	select {
+	case <-p.availRearm:
+	default:
+		t.Fatal("SetAvailProbeInterval 未发出唤醒通知")
+	}
+
+	// 改为 0（暂停）同样要唤醒。
+	p.SetAvailProbeInterval(0)
+	select {
+	case <-p.availRearm:
+	default:
+		t.Fatal("改成 0（暂停）未发出唤醒通知")
+	}
+	if got := time.Duration(p.availInterval.Load()); got != 0 {
+		t.Errorf("availInterval=%s want 0", got)
+	}
+}
+
+// 重复热改不能阻塞调用方（非阻塞发送 + 容量 1）。
+func TestSetAvailProbeIntervalDoesNotBlock(t *testing.T) {
+	p := New(Config{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 100; i++ {
+			p.SetAvailProbeInterval(time.Duration(i) * time.Minute)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("SetAvailProbeInterval 在无接收方时阻塞了（应非阻塞发送）")
+	}
+}
+
+// 间隔为 0 时 TTL 回落到手动模式（24h），而不是产生零值或负数。
+func TestAvailTTLWhenPaused(t *testing.T) {
+	var p Panel
+	p.availInterval.Store(0)
+	if got := p.availTTL(); got != availTTLManual {
+		t.Errorf("暂停时 availTTL()=%s want %s", got, availTTLManual)
+	}
+	// 确定性结论不受暂停影响，仍是 30 天。
+	if got := p.availLevelTTL("denied"); got != availTTLDeterministic {
+		t.Errorf("暂停时 denied TTL=%s want %s", got, availTTLDeterministic)
+	}
+}

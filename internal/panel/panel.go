@@ -99,6 +99,15 @@ type Panel struct {
 	// availInterval 模型可用性自动探测间隔（纳秒，atomic）。
 	// 0 = 暂停；运行期由 SetAvailProbeInterval 热改，下一轮生效。
 	availInterval atomic.Int64
+
+	// availRearm 探测间隔变更通知：SetAvailProbeInterval 写入新间隔后唤醒
+	// 后台循环立即按新值重排，而不是傻等旧 timer 到点。
+	//
+	// 为什么必须有这条通道：把间隔热改成 0（暂停）时，若无唤醒机制，循环要等
+	// 旧的 timer 到点才会读到 0；而读到 0 后 time.NewTimer(0) 会立即触发，
+	// 每一轮都立刻再触发一次 —— 变成对上游的紧循环。有了 rearm，改配置即刻生效、
+	// 且 0 走「阻塞等待唤醒」分支而不是建零长 timer。
+	availRearm chan struct{}
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -142,11 +151,12 @@ func New(cfg Config) *Panel {
 		cfg.RedisMode = "noop"
 	}
 	p := &Panel{
-		cfg:     cfg,
-		mux:     http.NewServeMux(),
-		started: time.Now(),
-		logs:    NewRing(500),
-		logins:  map[string]loginSession{},
+		cfg:        cfg,
+		mux:        http.NewServeMux(),
+		started:    time.Now(),
+		logs:       NewRing(500),
+		logins:     map[string]loginSession{},
+		availRearm: make(chan struct{}, 1),
 	}
 	p.routes()
 	return p
