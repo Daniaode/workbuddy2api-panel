@@ -36,8 +36,8 @@
     "blackcat_enabled": true,
     "balance_refresh_enabled": true,
     "balance_refresh_minutes": 5,
-    "balance_refresh_jitter_permill": 0,
-    "task_sweep_jitter_permill": 0,
+    "balance_refresh_jitter_permill": 250,
+    "task_sweep_jitter_permill": 250,
     "include_disabled_in_tasks": false
   },
   "global": {

@@ -351,6 +351,12 @@ func Default() *Config {
 	c.Schedule.BalanceRefreshMinutes = 5
 	c.Schedule.TaskSweepEnabled = true
 	c.Schedule.TaskSweepMinutes = 15
+	// 节拍抖动默认开启（±25%）：上游风控按「整点 + 全池同秒齐射」识别脚本，
+	// 这是 2026-10-28 两个国际号被 11140 封禁的直接特征。默认值写在这里
+	// 而不是 normalize()，是为了让「显式写 0」仍然能关闭它（Default 只提供
+	// 键缺席时的值，用户显式 0 会在 Unmarshal 时覆盖）。
+	c.Schedule.BalanceRefreshJitterPermill = 250
+	c.Schedule.TaskSweepJitterPermill = 250
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0

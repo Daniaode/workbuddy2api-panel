@@ -1047,11 +1047,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="hr"></div>
             <div class="grid2">
               <label class="fld"><span class="lb">余额刷新抖动（‰）</span>
-                <input name="balance_refresh_jitter_permill" type="number" min="0" max="500" placeholder="0">
-                <span class="hint">0 = 关闭。建议 250（±25%）</span></label>
+                <input name="balance_refresh_jitter_permill" type="number" min="0" max="500" placeholder="250">
+                <span class="hint">默认 250（±25%）；0 = 关闭</span></label>
               <label class="fld"><span class="lb">清扫抖动（‰）</span>
-                <input name="task_sweep_jitter_permill" type="number" min="0" max="500" placeholder="0">
-                <span class="hint">0 = 关闭。建议 250（±25%）</span></label>
+                <input name="task_sweep_jitter_permill" type="number" min="0" max="500" placeholder="250">
+                <span class="hint">默认 250（±25%）；0 = 关闭</span></label>
             </div>
             <div class="hint">周期任务「人味化」：上游风控按<b>机械节拍</b>识别脚本——此前余额刷新精确每 5 分钟整点、清扫精确每 15 分钟整点，且全池账号<b>同一秒并发齐射</b>。真人不会这样活动。开启后：① 每轮执行时刻 ±‰ 偏移；② 同轮各账号起点错开。2026-10-28 两个国际号因这类特征被 11140 封禁。</div>
             <div class="hint">周期扫描全部账号，把「进度已达标但尚未领奖」的成长任务补领掉（不含自动动作的口令任务也能领），并顺带接受未接受的任务。只发 accept / claim 两条<b>幂等</b>请求，不跑任何对话或上报行为，开销可忽略。<br>用途：真实对话点亮的任务不在自动动作白名单里，成长队列与「一键完成」都不会去领它——积分因此卡在半路上不去（#174）。</div>

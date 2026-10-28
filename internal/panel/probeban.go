@@ -111,8 +111,13 @@ type banProbeResult struct {
 // 第 3 步的求证很关键：实测 11140 封禁中的账号，余额端点返回的也可能是 401
 // APISIX HTML 页，与登录失效的响应体完全一样，只按 401 判会误报 session_dead。
 func (p *Panel) probeBanVerdict(a *auth.Auth, uid string) banProbeResult {
-	// 只读探测：UserResource 不进选号、不占在途、不记连败。
-	_, _, err := p.cfg.Upstream.UserResource(a)
+	// 只读探测：必须用 UserResourceReadOnly，不能用 UserResource。
+	//
+	// UserResource → UserResourceSnapshot → notifyCredits，会通知余额观察者，
+	// 把探测读到的余额写进积分流水的账本——那是「造出一条不存在的变动」。
+	// 探活是观测行为，不该在账本上留下痕迹（UserResourceReadOnly 正是为此存在：
+	// 语义与 Snapshot 完全一致，只是不通知观察者）。
+	_, _, err := p.cfg.Upstream.UserResourceReadOnly(a)
 	if err == nil {
 		return banProbeResult{BanLifted, "余额查询成功，上游已恢复"}
 	}
