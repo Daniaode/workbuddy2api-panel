@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
@@ -43,6 +44,18 @@ CHECKIN_STALE_DAYS = 2
 # 提前 72h 提醒才来得及安排迁移或确认续期。
 PROMO_EXPIRY_WARN_HOURS = 72
 
+# 端点超时预算。区别对待是必要的：
+#   overview / credit_history 直读内存，毫秒级；
+#   packages / compensation / models 要对每个账号扇出请求上游（并发 3），
+#   11 个账号就是 4 轮，单轮上游自身允许 120s。用同一个 20s 卡它们，
+#   任何一次上游抖动都会让整轮监视失败——实测 13:55 / 14:15 两次都是这样。
+TIMEOUT_FAST = 20.0
+TIMEOUT_SLOW = 60.0
+# 超时/网络层失败重试。不重试 HTTP 4xx：那是鉴权或配置问题，重试只是白等。
+# 预算约束：任务周期 1200s，三个慢端点最坏 3*(60*2+5)=375s，留得下余量。
+GET_RETRIES = 1
+GET_RETRY_DELAY = 5.0
+
 
 class PanelError(RuntimeError):
     pass
@@ -62,19 +75,39 @@ def load_config() -> tuple[str, str]:
     return f"http://{listen}", key
 
 
-def get(base: str, key: str, path: str, timeout: float = 20.0):
-    req = urllib.request.Request(
-        base + path,
-        headers={"Authorization": "Bearer " + key, "Accept": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", "replace")[:200]
-        raise PanelError(f"{path} -> HTTP {e.code}: {body}") from e
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        raise PanelError(f"{path} 不可达: {e}") from e
+def get(base: str, key: str, path: str, timeout: float = TIMEOUT_FAST,
+        retries: int = GET_RETRIES):
+    """拉一个面板接口，超时/网络层失败重试 retries 次。
+
+    扇出型接口（packages/compensation）本身就会跑十几秒，偶发一次慢速
+    不代表面板坏了。重试能把「一次抖动」和「真的坏了」区分开；
+    HTTP 4xx 不重试，直接报。
+    """
+    attempts = 0
+    while True:
+        req = urllib.request.Request(
+            base + path,
+            headers={"Authorization": "Bearer " + key,
+                     "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace")[:200]
+            raise PanelError(f"{path} -> HTTP {e.code}: {body}") from e
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            reason = "timed out" if isinstance(e, TimeoutError) \
+                or "timed out" in str(e) else str(e)
+            if attempts >= retries:
+                raise PanelError(
+                    f"{path} 不可达: {reason}（已尝试 {attempts + 1} 次，"
+                    f"每次 {timeout:g}s）") from e
+            attempts += 1
+            print(f"积分监视：{path} 慢（{reason}），"
+                  f"{GET_RETRY_DELAY:.0f}s 后重试 {attempts}/{retries}",
+                  file=sys.stderr)
+            time.sleep(GET_RETRY_DELAY)
 
 
 def parse_ts(s: str) -> datetime | None:
@@ -88,13 +121,13 @@ def parse_ts(s: str) -> datetime | None:
 
 def snapshot(base: str, key: str) -> dict:
     """一次性拉齐四类观测。任何一个接口失败都算失败——半份快照会得出错结论。"""
-    ov = get(base, key, "/panel/api/overview")
-    pk = get(base, key, "/panel/api/packages")
-    comp = get(base, key, "/panel/api/compensation")
-    hist = get(base, key, "/panel/api/credit_history?limit=200")
+    ov = get(base, key, "/panel/api/overview", timeout=TIMEOUT_FAST)
+    pk = get(base, key, "/panel/api/packages", timeout=TIMEOUT_SLOW)
+    comp = get(base, key, "/panel/api/compensation", timeout=TIMEOUT_SLOW)
+    hist = get(base, key, "/panel/api/credit_history?limit=200", timeout=TIMEOUT_FAST)
     # 免费模型优惠：接口缺失/旧版本时给空列表，不影响其余观测。
     try:
-        md = get(base, key, "/panel/api/models")
+        md = get(base, key, "/panel/api/models", timeout=TIMEOUT_SLOW)
         promos = [
             m for m in (md.get("models") or [])
             if m.get("promo_factor") == 0

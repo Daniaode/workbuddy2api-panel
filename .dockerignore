@@ -4,6 +4,7 @@ data/
 .git/
 .gitignore
 docs/
+.gocache/
 scripts/__pycache__/
 # 根目录已提交/未提交的二进制产物不进构建上下文（与 .gitignore 对齐）
 /login
