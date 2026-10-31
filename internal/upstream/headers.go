@@ -7,34 +7,48 @@ import (
 	"encoding/hex"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 )
 
 const (
-	// defaultClientVersion 出站 WorkBuddy 客户端版本段（UA 的 `WorkBuddy/<ver>` 与
-	// X-IDE-Version）。
-	//
-	// 取值依据（A 级，官方 5.9.2 Windows 安装包）：
-	//   resources/app.asar.unpacked/cli/product.json 的 genieVersion = "5.9.2"；
-	//   安装包文件名 WorkBuddy-win32-x64-user-5.9.2.42136757-0b5051be.exe；
-	//   product.json 的 commit = 0b5051be...、date = 2026-10-24。
-	//
-	// config upstream.client_version 可覆盖（空 = 内置默认）。
-	defaultClientVersion = "5.9.2"
-	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。
-	//
-	// 取值依据（A 级，同一安装包）：内置 CLI 的 bundle 里
-	// publishConfig.customPackage.name = "@tencent-ai/codebuddy-code"，
-	// version = "2.165.0"。
-	//
-	// config upstream.cli_version 可覆盖（空 = 内置默认）。
-	defaultCliVersion = "2.165.0"
+	// 官方分发包实测版本（2026-10-28：安装包解包 + 真机抓包，同谱系仓库
+	// enticingns/workbuddy-gateway 核对）——两版不同轨：
+	//   CN     桌面 5.9.3（commit d469242）/ 内嵌 CLI 2.165.0
+	//   global 桌面 5.8.4（commit 73952edb）/ 内嵌 CLI 2.161.0
+	// 取值依据（A 级）：resources/app.asar.unpacked/cli/product.json 的 genieVersion；
+	// 内嵌 CLI 版本取 dist/codebuddy-lite-wb.mjs 的 publishConfig.customPackage.version。
+	// config upstream.client_version / cli_version 非空时同时覆盖两域（兼容旧配置）。
+	defaultClientVersionCN     = "5.9.3"
+	defaultCliVersionCN        = "2.165.0"
+	defaultClientVersionGlobal = "5.8.4"
+	defaultCliVersionGlobal    = "2.161.0"
+
+	// 旧名保留：默认账号形态即 CN，零回归兼容既有调用点/测试。
+	defaultClientVersion = defaultClientVersionCN
+	defaultCliVersion    = defaultCliVersionCN
 
 	// deploymentType 官方 product.json 的 deploymentType（两个安装包都是 SaaS），
 	// 由 ProductEndpointHttpInterceptor 作为 X-Product 加到每个请求上。
 	deploymentType = "SaaS"
+
+	// 关于 x-stainless-* 头族：官方客户端**主动删除**它们，本网关也不发。
+	//
+	// 依据（A 级，官方 5.8.3 Windows 安装包 app.asar.unpacked/cli/dist/
+	// codebuddy-lite-wb.mjs）：内置 CLI 构造 openai-node 客户端后装了
+	// transformRequest，把前缀为 `x-stainless-` 的头逐个 delete：
+	//
+	//	i = ["x-stainless-"]
+	//	i.some(t => p.startsWith(t)) && delete s[n]
+	//
+	// 同一处删除名单还含 User-Agent / X-Domain / X-User-Id 等——官方在把
+	// SDK 自带的默认头换成自己的。所以「发 stainless 头才像官方」正好相反：
+	// 发了反而是 SDK 直连形态，官方客户端不会有这族头。
+	//
+	// 历史教训：此前按「真机抓包看到 stainless」加过七头，但抓到的多半是
+	// SDK 拦截器替换前的中间态；包内证据表明最终出站不含它们。
 
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
@@ -50,20 +64,38 @@ func originRefererFor(a *auth.Auth) string {
 }
 
 // clientVersion 生效的 WorkBuddy 客户端版本：Client.ClientVersion 非空则取之，
-// 否则内置默认 defaultClientVersion。
+// 否则按账号 realm 取默认（nil 账号 = CN）。
 func (c *Client) clientVersion() string {
+	return c.clientVersionFor(nil)
+}
+
+// clientVersionFor 按账号 realm 取桌面端版本：显式 ClientVersion 优先（同时覆盖两域），
+// 否则 CN 5.9.3 / global 5.8.4（官方两个分发包不同轨，实测值）。
+func (c *Client) clientVersionFor(a *auth.Auth) string {
 	if c != nil && c.ClientVersion != "" {
 		return c.ClientVersion
 	}
-	return defaultClientVersion
+	if a != nil && a.IsGlobal() {
+		return defaultClientVersionGlobal
+	}
+	return defaultClientVersionCN
 }
 
-// cliVersion 生效的 CLI 版本：Client.CliVersion 非空则取之，否则内置默认 defaultCliVersion。
+// cliVersion 生效的 CLI 版本：Client.CliVersion 非空则取之，否则按账号 realm 取默认。
 func (c *Client) cliVersion() string {
+	return c.cliVersionFor(nil)
+}
+
+// cliVersionFor 按账号 realm 取内嵌 CLI 版本：显式 CliVersion 优先，
+// 否则 CN 2.165.0 / global 2.161.0。
+func (c *Client) cliVersionFor(a *auth.Auth) string {
 	if c != nil && c.CliVersion != "" {
 		return c.CliVersion
 	}
-	return defaultCliVersion
+	if a != nil && a.IsGlobal() {
+		return defaultCliVersionGlobal
+	}
+	return defaultCliVersionCN
 }
 
 // defaultWorkBuddyUAFor 组装默认客户端出站 UA（官方桌面端 RestOperations 层形状）：
@@ -78,7 +110,7 @@ func (c *Client) defaultWorkBuddyUAFor(a *auth.Auth) string {
 	if a != nil && a.IsGlobal() {
 		platform = "WorkBuddy AI"
 	}
-	return "WorkBuddy/" + c.clientVersion() + " " + platform + "/" + c.clientVersion() + " CLI/" + c.cliVersion()
+	return "WorkBuddy/" + c.clientVersionFor(a) + " " + platform + "/" + c.clientVersionFor(a) + " CLI/" + c.cliVersionFor(a)
 }
 
 // defaultWorkBuddyUA 返回 CN 形态的默认 UA（默认账号形态即 CN，零回归兼容既有调用/测试）。
@@ -107,7 +139,7 @@ func (c *Client) billingUA(a *auth.Auth) string {
 	// 单段 UA 同样要跟账号域走：global 账号的归属头是 `WorkBuddy AI`，
 	// billing UA 若固定 `WorkBuddy/`，两者在同一个请求里前后不一致。
 	name := c.attributionClientName(a)
-	return name + "/" + c.clientVersion()
+	return name + "/" + c.clientVersionFor(a)
 }
 
 // resolveDeviceToken 解析本次请求的 X-Device-Token 取值。
@@ -287,6 +319,9 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	} else {
 		c.injectGlobalChatHeaders(req, a)
 	}
+	// ACP 连接标识（官方桌面端每个本地 agent 连接一个）。
+	// 注意：不注入 x-stainless-* —— 官方客户端会主动删除该族（见上方常量注释）。
+	c.injectACP(req)
 	// 用量归属头：默认伪造 WorkBuddy 桌面端指纹（client_name="SaaS" 还原旧行为）。
 	c.injectAttribution(req, a)
 	if !c.legacyHeaders() {
@@ -303,8 +338,8 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	c.injectClientIP(req, clientIP)
 	// 设备风控头：auth 每号 > config 全局 > 文件兜底；空则不注入。
 	c.injectDeviceToken(req, a)
-	// 会话头族（对话/请求/消息/B3 链路），见 injectConversationHeaders。
-	c.injectConversationHeaders(req, meta)
+	// 会话头族（对话/请求/消息/B3 链路/traceparent/baggage），见 injectConversationHeaders。
+	c.injectConversationHeaders(req, a, meta)
 }
 
 // injectGlobalChatHeaders global 账号（无企业 ID）的 chat 专属声明头，对齐 intl 项目
@@ -321,6 +356,29 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("X-Domain", "www.workbuddy.ai")
 }
 
+// acpOnce/acpID 本进程的 acp-connection-id（进程级惰性生成一次：一次部署=一个
+// 网关连接，语义上比逐请求新值更贴近官方——官方每个连接内恒定，不会每请求换）。
+var (
+	acpOnce sync.Once
+	acpID   string
+)
+
+// acpConnID 返回本进程的 acp-connection-id（ACP = agent-client-protocol 连接标识，
+// 官方桌面端每个本地 agent 连接一个 UUIDv7）。
+func acpConnID() string {
+	acpOnce.Do(func() {
+		acpID = session.NewUUIDv7()
+	})
+	return acpID
+}
+
+// injectACP 注入 acp-connection-id（仅 chat 路径；官方其他端点不带）。
+func (c *Client) injectACP(req *http.Request) {
+	if id := acpConnID(); id != "" {
+		req.Header.Set("acp-connection-id", id)
+	}
+}
+
 // injectConversationHeaders 注入官方客户端会话头族（issue #35 后台聚合）。
 // 头族分四层，各司其职：
 //   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId）。空则不发——
@@ -333,7 +391,7 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
 //   - X-B3-TraceId / X-B3-SpanId / X-B3-Sampled：链路族。B3 规范只认 16/32 hex
 //     TraceId 与 16 hex SpanId；入站 conversationRequestID 非法时 TraceId 回落
 //     messageID（恒 32 hex），SpanId 取 messageID[:16]（每消息新）。
-func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
+func (c *Client) injectConversationHeaders(req *http.Request, a *auth.Auth, meta ChatMeta) {
 	convReqID := meta.ConversationRequestID
 	if convReqID == "" {
 		// 零值 meta（直接调 ChatHeaders 的调用方/测试）也要保证聚合主键必发：
@@ -371,6 +429,17 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	req.Header.Set("X-B3-TraceId", b3Trace)
 	req.Header.Set("X-B3-SpanId", messageID[:16])
 	req.Header.Set("X-B3-Sampled", "1")
+	// traceparent（W3C）/ b3（Zipkin 单头）与 X-B3-* 同源：官方实测三套格式并存，
+	// 只发其中一套本身就是「非官方链路」的指纹。
+	req.Header.Set("traceparent", "00-"+b3Trace+"-"+messageID[:16]+"-01")
+	req.Header.Set("b3", b3Trace+"-"+messageID[:16]+"-1")
+	// baggage / X-Agent-Runtime 仅 CN 分档：官方 5.9.3（CN）带、5.8.4（intl）不带。
+	// baggage 的 buddyId/buddyName 官方置空串，两个 id 取自会话头族。
+	if a == nil || !a.IsGlobal() {
+		req.Header.Set("baggage", "buddyId=,buddyName=,codebuddy.session_id="+conversationID+
+			",codebuddy.conversation_request_id="+convReqID)
+		req.Header.Set("X-Agent-Runtime", "local-agent")
+	}
 }
 
 // validTraceID 判断 B3 TraceId 是否合法：16 或 32 位 hex（大小写均可）。
@@ -421,7 +490,7 @@ func (c *Client) injectAttribution(req *http.Request, a *auth.Auth) {
 	req.Header.Set("X-Agent-Purpose", "conversation")
 	req.Header.Set("X-IDE-Name", name)
 	req.Header.Set("X-IDE-Type", name)
-	req.Header.Set("X-IDE-Version", c.clientVersion())
+	req.Header.Set("X-IDE-Version", c.clientVersionFor(a))
 	// X-Product 与 X-IDE-* 取值来源不同，不能一起跟随 name：
 	//   - X-Product 是产品配置里的 deploymentType，两个安装包都是 "SaaS"
 	//     （官方 ProductEndpointHttpInterceptor）；

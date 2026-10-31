@@ -61,6 +61,16 @@ type DesktopEvent map[string]any
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
 func desktopFingerprint(a *auth.Auth) map[string]any {
 	now := time.Now().UnixMilli()
+	// 硬件档案按账号派生，不要全池共用一套常量。
+	//
+	// 为什么：machineId 已是按 uid 派生的不同值，但 cpuCores/memorySize 若恒为
+	// 20/24，就形成「几十台不同机器却完全同配置」的矛盾特征——真实多机环境不会
+	// 这样整齐，反而比不伪装更可疑。改成同样从 uid 稳定派生的合理区间
+	// （12–15 核 / 16 或 32 GB，取自主流 Windows 开发机分布）。
+	//
+	// 与 machineId 同一套 deriveID 口径：同账号恒定（同一台机器不该每次上报变配置），
+	// 不同账号不同（不同机器）。osVersion 同理给两档。
+	hw := deriveHardwareProfile(a)
 	return map[string]any{
 		"timezone":     "Asia/Shanghai",
 		"reportDelay":  2000,
@@ -79,12 +89,40 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 		"extVersion":   defaultClientVersion,
 		"os":           "win32",
 		"arch":         "x64",
-		"osVersion":    "10.0.26220",
-		"cpuCores":     20,
-		"memorySize":   24,
+		"osVersion":    hw.osVersion,
+		"cpuCores":     hw.cpuCores,
+		"memorySize":   hw.memorySize,
 		"timestamp":    now,
 		"presentAt":    now,
 	}
+}
+
+// hardwareProfile 单账号的硬件档案（稳定派生）。
+type hardwareProfile struct {
+	osVersion  string
+	cpuCores   int
+	memorySize int
+}
+
+// deriveHardwareProfile 从 uid 稳定派生一份硬件档案。
+//
+// 取值来源：主流 Windows 开发机分布——12/14/16 核 + 16/32 GB，
+// Windows 11 的两个常见 build（26200 / 26220）。
+//
+// 为什么用派生而不是随机：同一账号每次上报必须是同一台机器，随机值本身就是
+// 破绽（真人不会每隔几小时换一次 CPU 核心数）。
+func deriveHardwareProfile(a *auth.Auth) hardwareProfile {
+	if a == nil {
+		return hardwareProfile{osVersion: "10.0.26220", cpuCores: 20, memorySize: 24}
+	}
+	sum := sha256.Sum256([]byte("hw:" + a.UID))
+	cores := [...]int{12, 14, 16}[sum[0]%3]
+	mem := [...]int{16, 32}[sum[1]%2]
+	osv := "10.0.26220"
+	if sum[2]%2 == 1 {
+		osv = "10.0.26200"
+	}
+	return hardwareProfile{osVersion: osv, cpuCores: cores, memorySize: mem}
 }
 
 // ReportDesktopEvent 以桌面客户端指纹向 copilot.tencent.com/v2/report 批量上报事件。
