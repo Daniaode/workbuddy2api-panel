@@ -48,11 +48,19 @@ B 级文档看起来最权威（对方声称解包过安装包），但有两个
 
 | 项 | 官方真实值 | 出处 |
 |---|---|---|
-| 客户端版本 | **`5.9.2`** | `product.json` 的 `genieVersion`；安装包文件名 `...-5.9.2.42136757-...` |
-| CLI 版本 | **`2.165.0`** | `dist/codebuddy-lite-wb.mjs` 内 `publishConfig.customPackage = {name:"@tencent-ai/codebuddy-code", version:"2.165.0"}` |
+| 客户端版本 | **CN `5.9.3`** / **global `5.9.4`** | 两个安装包各自的 `product.json` 的 `genieVersion`（两条独立发布轨） |
+| CLI 版本 | **`2.165.0`**（两包一致） | `dist/codebuddy-lite-wb.mjs` 内 `publishConfig.customPackage = {name:"@tencent-ai/codebuddy-code", version:"2.165.0"}` |
 | `deploymentType` | `SaaS` | `product.json` |
-| `applicationName` / `productName` | `WorkBuddy` | `product.json` |
-| `commit` / `date` | `0b5051be…` / `2026-10-24T08:44:37.992Z` | `product.json` |
+| `applicationName` | CN `WorkBuddy` / global **`workbuddy-ai`** | `product.json`（注意两域不同，且 global 是连字符） |
+| `productName` | CN `WorkBuddy` / global `WorkBuddy AI` | `product.json`（global 带空格） |
+| `commit` | CN `d4692421…` / global `fa0a0901…` | `product.json` |
+
+安装包（2026-11-01 实测）：
+
+```
+CN     WorkBuddy-win32-x64-user-5.9.3.42398134-d4692421.exe
+global WorkBuddy-win32-x64-user-5.9.4.42593613-fa0a0901.exe
+```
 
 对应常量：`internal/upstream/headers.go` 的 `defaultClientVersion`、`defaultCliVersion`、`deploymentType`。
 
@@ -166,16 +174,92 @@ wb2api-chat5-...-3            wb2api-adopt-1750000000000
 灵感案例 `pm-gtm-launch-plan` 已核实存在于官方 registry（1274 个案例之一，
 标题「新产品上市 GTM 发布计划一页纸」），无需改动。
 
+### 1.7 Web 域身份（Electron 客户端，2026-11-01 抓包实证）
+
+`www.workbuddy.cn` 的页面行为类请求（`/v2/report` 等）由 **Electron 渲染进程**发出，
+与 chat（Node CLI 子进程）是两套完全不同的身份。
+
+**UA（三次抓包逐字一致，全池恒定）**：
+
+```
+Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)
+WorkBuddy/5.9.3 Chrome/138.0.7204.251 Electron/37.10.3 Safari/537.36
+```
+
+三个要点：
+
+1. **是 Electron 应用**：同时带 `WorkBuddy/<ver>`、`Chrome/138`、`Electron/37`
+2. **全池恒定**：官方一台机器装一份客户端、多个账号共用，不按账号换浏览器
+3. **不是国产浏览器**：曾按「国内用户浏览器混杂」做过 UC/搜狗/360/QQ/微信 按 uid
+   派生（commit 8d469b1），方向错误——那是真人浏览网页的分布，多账号各带不同 UA
+   反而暴露代理池特征。已在 cff80c5 推翻
+
+**浏览器提示头（九个，逐请求恒定）**：
+
+| 头 | 值 |
+|---|---|
+| `sec-ch-ua` | `"Not)A;Brand";v="8", "Chromium";v="138",?0` |
+| `sec-ch-ua-mobile` | `?0` |
+| `sec-ch-ua-platform` | `"Windows"` |
+| `sec-fetch-site` | `cross-site`（XHR）/ `none`（导航） |
+| `sec-fetch-mode` | `cors`（XHR）/ `no-cors`（导航） |
+| `sec-fetch-dest` | `empty` |
+| `accept-language` | `zh-CN` |
+| `accept-encoding` | `gzip, deflate, br, zstd` |
+| `priority` | `u=1, i` |
+
+缺这族头的 Electron 应用不存在（Chromium 内核自己会加），少了它们
+「Mozilla ... Electron/37」这个 UA 反而成孤证。
+
+实现：`internal/upstream/webua.go` 的 `webUAFor` + `injectWebClientHints`。
+
 ## 二、未对齐 / 待验证
 
-| 项 | 现状 | 原因 |
+2026-11-01 对 Windows 官方客户端 5.9.3 做了三次 pcap + SSLKEYLOGFILE 实抓解密，
+下表按实测结论重写（旧表有 4 项判断已被推翻）。
+
+| 项 | 现状 | 实测结论 |
 |---|---|---|
+| **Web 域 UA** | 已对齐 | 官方是 **Electron 应用**：`Mozilla/5.0 (...) WorkBuddy/<ver> Chrome/138.0.7204.251 Electron/37.10.3 Safari/537.36`，**全池恒定、不按账号变**。见 §1.7 |
+| **Web 域浏览器提示头** | 已对齐 | `sec-ch-ua` / `sec-ch-ua-mobile` / `sec-ch-ua-platform` / `sec-fetch-*` / `accept-language` / `accept-encoding` / `priority` 九头，见 §1.7 |
+| **ALPN** | 与官方一致 | 官方**三种形态混用**（三次抓包：47/28/23 条不发、37/27/20 条 http/1.1、6/1/1 条 h2,http/1.1）。我们不发 ALPN，属其中一种，**不是差异** |
 | **TLS 指纹** | Go 标准库 | 官方是 Node/Electron 握手。要对齐需引入 uTLS，风险高、收益不确定 |
-| **HTTP/2** | 有意禁用 | 禁 h2 是历史故障（半死连接）的修复，回退会引入老问题 |
+| **HTTP/2** | 有意禁用 | chat 走内置 **Node CLI 子进程**，它本身也不发 ALPN → 实际就是 HTTP/1.1。禁 h2 与此一致 |
 | **`X-Department-Info`** | 不发 | 只有企业号才有该值；池里没有带部门的企业号，无法验证 |
-| **`Accept-Encoding`** | Go 自动加 `gzip` | 官方是 axios 的 `gzip, compress, deflate, br`。精确控制需关闭 Go 自动压缩并自行解压，改动面偏大 |
-| **`traceparent`** | 不发 | 官方用 OTel 注入；我们没有 OTel，且格式影响面未评估 |
-| **国际版 UA 平台段** | `WorkBuddy AI` | 本轮解的是 Windows 国内版包，国际版包未取到 |
+| **cookie** | 不发 | 官方 web 请求带 `session=...`（超长串）并回 `set-cookie`。复刻需完整会话管理，收益不确定，不做 |
+| **chat 头族** | 推断对齐 | **三次抓包均无法观测**：chat 由 Node 子进程发出，它不读 `SSLKEYLOGFILE`、也覆盖 `NODE_OPTIONS`（实测 `nodekeys.log` 从未生成），且不发 ALPN → 该流量无法旁路解密。现依据取自安装包 `buildConversationHeaders` 全文 |
+
+### 2.1 chat 流量为什么抓不到（重要）
+
+三次抓包的对照统计完全一致：
+
+```
+ALPN 状态    流数      解密成功
+有 ALPN      43–44     4–6
+无 ALPN      47–37     0        ← 一条都解不开
+```
+
+原因链：
+
+1. WorkBuddy 是 Electron 应用，但 **chat 请求由内置 Node.js CLI 子进程发出**
+2. `SSLKEYLOGFILE` 只对 Chromium 网络栈生效，**Node 不自动写**
+3. `NODE_OPTIONS=--tls-keylog=...` 被客户端覆盖（本机实测该参数本身可用，但子进程没继承）
+4. Node 握手**不发 ALPN** → tshark 无法判定协议，即使有密钥也解不出
+
+**结论**：chat 头族无法通过旁路抓包验证。要继续验证只能上 mitmproxy（需装 CA，
+且可能撞证书固定），性价比低——字段清单已从安装包完整提取并逐项对齐。
+
+### 2.2 为什么不再追求「头名大小写」
+
+实测官方线上字节是 `X-Conversation-ID` / `X-IDE-Name` / `X-B3-SpanId`（末段全大写），
+而 Go 的 `Header.Set` 会规范化成 `X-Conversation-Id` / `X-Ide-Name` / `X-B3-Spanid`。
+
+曾尝试用 `setExact`（直接写 map）绕过，**已回退**，两个硬理由：
+
+1. 破坏 `Header.Get` 语义（3 个测试当场失败）
+2. 与 `Set` 混用会产生**重复头**（同一个 `X-Request-ID` 发两个不同值）
+
+且 HTTP 头名按 RFC 7230 大小写不敏感，服务端必归一化——**不构成有效指纹**。
 
 ## 三、官方升级后怎么核对
 
@@ -187,10 +271,58 @@ wb2api-chat5-...-3            wb2api-adopt-1750000000000
    7z x -y -oext2 'ext1/$PLUGINSDIR/app-64.7z'
    # 关键文件在 ext2/resources/app.asar.unpacked/cli/
    ```
-3. 读 `product.json`：`genieVersion`、`deploymentType`、`applicationName`、`commit`、`date`。
+**两条发布轨要分别取包**（版本号不同步）：
+
+```
+CN     https://download.codebuddy.cn/workbuddy/saas/win32-x64-user/...
+global https://download.codebuddy.ai/workbuddy/saas/win32-x64-user/...
+```
+
+3. 读 `product.json`：`genieVersion`、`deploymentType`、`applicationName`、`productName`、`commit`、`date`。
 4. 在 `dist/codebuddy-lite-wb.mjs` 里搜 `"@tencent-ai/codebuddy-code","version":"` 取 CLI 版本。
 5. 在 `app.asar` 里搜 `Accept-Language`、`fetchResourcePackagesPage` 核对语言头。
 6. 改常量后跑 `go test ./internal/upstream/`，并按下面方式抓一次真实出站复核。
+
+### 3.1 用抓包复核 Web 域身份（可行，已验证）
+
+Wireshark + `SSLKEYLOGFILE` 可以完整解出 Electron 的 web 域请求。**顺序很关键**：
+
+```powershell
+mkdir C:\wb
+[Environment]::SetEnvironmentVariable("SSLKEYLOGFILE", "C:\wb\sslkeys.log", "User")
+# 彻底退出 WorkBuddy（含托盘图标与 node 子进程），然后：
+#   1) 先开 Wireshark 开始捕获
+#   2) 再启动 WorkBuddy        ← 顺序反了会导致 keylog 与 pcap 对不上
+#   3) 等界面加载完，操作几个页面
+#   4) 停止捕获，连同 sslkeys.log 一起保存
+```
+
+判定 `tshark` 能否解密：
+
+```bash
+# ClientHello random 与 keylog 的交集必须 > 0，否则两份文件不是同一时段
+comm -12 <(tshark -r cap.pcapng -Y 'tls.handshake.type==1' \
+             -T fields -e tls.handshake.random | tr 'A-F' 'a-f' | sort -u) \
+         <(awk '{print tolower($2)}' sslkeys.log | sort -u) | wc -l
+```
+
+解出请求与头：
+
+```bash
+tshark -r cap.pcapng -o tls.keylog_file:sslkeys.log \
+  -Y "http2.headers.method" -T fields \
+  -e http2.headers.method -e http2.headers.path -e http2.headers.authority
+```
+
+**两个实测坑**：
+
+- 抓包前 WorkBuddy 已建立的持久连接，其 ClientHello 不在窗口内 → 密钥对不上
+- 同一域名下会有大量**不解密**的流，那是 chat 用的 Node 子进程（见 §2.1），不是失败
+
+### 3.2 chat 头族无法抓包验证（已知限制）
+
+见 §2.1：Node 子进程不写 keylog、覆盖 `NODE_OPTIONS`、不发 ALPN，三位一体导致
+该流量无法旁路解密。验证 chat 只能读安装包（`buildConversationHeaders`）。
 
 ### 抓一次真实出站复核
 
@@ -225,7 +357,7 @@ X-Root-Request-Id, X-Trace-Id, X-User-Id
 |---|---|
 | 照搬参考仓库代码 | 该仓库自 v1.4.0 起是 **AGPL-3.0-only** 并附 Section 7 附加条款（保留声明、README 署名、界面署名、不得冒充原版）。本仓库是 MIT，直接复制会造成许可冲突。只借鉴方向，实现全部重写 |
 | TLS 指纹对齐（uTLS） | 换传输库风险高；需先在真机抓包才能确认目标值 |
-| 伪造不存在的版本号 | 已改为报真实版本（5.8.3 / 2.161.0），有包内证据 |
+| 伪造不存在的版本号 | 始终报真实版本（当前 CN 5.9.3 / global 5.9.4，CLI 2.165.0），有包内证据 |
 
 ## 五、变更记录
 
@@ -240,3 +372,9 @@ X-Root-Request-Id, X-Trace-Id, X-User-Id
 | 2026-10-27 | UA `5.8.3` → `5.9.2`，CLI `2.161.0` → `2.165.0`；`desktop.go` 桌面指纹版本号从硬编码 5.5.6 改为复用 `defaultClientVersion`/`defaultCliVersion` 常量（此前 chat 出站已升 5.8.3，桌面行为上报仍停 5.5.6，不一致） | `product.json`（`5.9.2.42136757-0b5051be.exe` 解包）+ bundle `publishConfig` |
 | 2026-10-24 | `Accept-Language` 仅积分包查询发短值 `zh`/`en` | `fetchResourcePackagesPage` |
 | 2026-10-24 | 成长任务事件三处自造取值（任务名/模板 id/messageId）替换 | 官方 registry + 模板目录 |
+| 2026-11-01 | 版本号双轨：CN `5.9.3` / global `5.9.4`，CLI 两域均 `2.165.0` | 两包 `product.json` + bundle `publishConfig` |
+| 2026-11-01 | 国际版 UA 平台段定为 **`WorkBuddy AI`（空格）**：包内 `buildUserAgent` 取 `applicationName ?? productName`，而运行时未注入 `CLIENT_INFO_APPLICATION_NAME`，故落到 `productName`。反驳了外部 `workbuddy-ai`（连字符）的说法 | `app.asar` 的 `UserAgentHttpInterceptor` |
+| 2026-11-01 | **移除 `x-stainless-*` 七头**：官方包内唯一 stainless 出现在删除逻辑（`i=["x-stainless-"]; delete s[n]`），发它反而呈 SDK 直连形态 | `app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs` |
+| 2026-11-01 | Web 域 UA 定为 **Electron 固定形态**（全池恒定），推翻按 uid 派生国产浏览器的做法 | 三次 pcap + SSLKEYLOGFILE 解密实测 |
+| 2026-11-01 | Web 域补九个浏览器提示头（`sec-ch-ua*` / `sec-fetch-*` / `priority` 等） | 同上 |
+| 2026-11-01 | 桌面指纹硬件档案按 uid 派生（12/14/16 核 + 16/32G + 两个 Win11 build） | 原为全池恒定 20 核/24G，同配置多机属矛盾特征 |
