@@ -14,17 +14,23 @@ import (
 )
 
 const (
-	// 官方分发包实测版本（2026-10-28：安装包解包 + 真机抓包，同谱系仓库
-	// enticingns/workbuddy-gateway 核对）——两版不同轨：
-	//   CN     桌面 5.9.3（commit d469242）/ 内嵌 CLI 2.165.0
-	//   global 桌面 5.8.4（commit 73952edb）/ 内嵌 CLI 2.161.0
-	// 取值依据（A 级）：resources/app.asar.unpacked/cli/product.json 的 genieVersion；
-	// 内嵌 CLI 版本取 dist/codebuddy-lite-wb.mjs 的 publishConfig.customPackage.version。
+	// 官方分发包实测版本（2026-11-01：两个官方安装包分别解包比对）——
+	// CN 与 global 是**两条独立发布轨**，版本号不同步：
+	//
+	//	CN     5.9.3  commit d4692421  CLI 2.165.0
+	//	       WorkBuddy-win32-x64-user-5.9.3.42398134-d4692421.exe
+	//	global 5.9.4  commit fa0a0901  CLI 2.165.0
+	//	       WorkBuddy-win32-x64-user-5.9.4.42593613-fa0a0901.exe
+	//
+	// 取值依据（A 级）：两包 resources/app.asar.unpacked/cli/product.json 的
+	// genieVersion / commit；CLI 版本取 dist/codebuddy-lite-wb.mjs 的
+	// publishConfig.customPackage.version（两包同为 2.165.0）。
+	//
 	// config upstream.client_version / cli_version 非空时同时覆盖两域（兼容旧配置）。
 	defaultClientVersionCN     = "5.9.3"
 	defaultCliVersionCN        = "2.165.0"
-	defaultClientVersionGlobal = "5.8.4"
-	defaultCliVersionGlobal    = "2.161.0"
+	defaultClientVersionGlobal = "5.9.4"
+	defaultCliVersionGlobal    = "2.165.0"
 
 	// 旧名保留：默认账号形态即 CN，零回归兼容既有调用点/测试。
 	defaultClientVersion = defaultClientVersionCN
