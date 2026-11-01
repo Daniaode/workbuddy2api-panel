@@ -304,7 +304,9 @@ func DesktopAutomationCreateEvent(name string) DesktopEvent {
 // 与桌面指纹（copilot 域）不同：web 域事件是浏览器形状（os/machineId/userAgent），
 // 用于 Library_read 等页面行为类任务（实测 library_doc_intro_click 4 秒点亮）。
 func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, elementName string) error {
-	ua := deriveWebUA(a)
+	// UA 与浏览器提示头取官方 Electron 客户端实测形态（见 webua.go 的抓包依据）。
+	// 关键点：全池恒定，不按账号派生——官方一台机器多个账号共用一个客户端。
+	ua := webUAFor(c, a)
 	ev := map[string]any{
 		"eventCode": eventCode, "timestamp": time.Now().UnixMilli(), "reportDelay": 0,
 		"pageURL": pageURL, "elementId": elementID, "elementName": elementName,
@@ -327,6 +329,9 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	req.Header.Set("Origin", c.webBase(a))
 	req.Header.Set("Referer", pageURL)
 	req.Header.Set("User-Agent", ua)
+	// 官方 Electron 客户端在 web 域的浏览器提示头（抓包实证，见 webua.go）。
+	// 这是 XHR 形态：cross-site + cors（导航请求才是 none + no-cors）。
+	injectWebClientHints(req, "cross-site", "cors")
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}

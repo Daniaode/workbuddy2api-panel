@@ -1,146 +1,162 @@
 package upstream
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
 
-// Web 域事件的浏览器 UA 必须按 uid 稳定派生：同账号恒定、不同账号分散。
+// Web 域 UA 必须是**官方 Electron 客户端形态**，且全池恒定。
 //
-// 回归背景：此前 ReportWebEvent 的 UA 是硬编码的 Chrome 152，于是全池呈现
-// 「machineId 各不相同（不同机器）但浏览器版本完全一致」的矛盾特征。
-// 真实用户群里不可能全员同一浏览器版本，国产环境更是 Chrome/Edge/QQ/360/
-// 搜狗/UC/微信 混杂。
-func TestDeriveWebUAStablePerAccount(t *testing.T) {
-	a := &auth.Auth{UID: "acct-a"}
+// 依据（A 级实证）：官方 5.9.3 客户端 pcap + SSLKEYLOGFILE 解密，
+// workbuddy.cn 全部请求的 UA 逐字为：
+//
+//	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)
+//	WorkBuddy/5.9.3 Chrome/138.0.7204.251 Electron/37.10.3 Safari/537.36
+//
+// 这条测试防止再次退回「按账号派生国产浏览器」的错误方向——那是真人浏览网页的
+// 分布，不是官方客户端发请求的形态；多账号各带不同 UA 反而暴露代理池特征。
+func TestWebUALooksLikeOfficialElectron(t *testing.T) {
+	c := New()
+	cn := &auth.Auth{UID: "u1", Domain: "copilot.tencent.com"}
+	cn.BackfillRealm()
 
-	// 同账号重复调用必须完全一致（真人不换浏览器）。
-	first := deriveWebUA(a)
-	for i := 0; i < 20; i++ {
-		if got := deriveWebUA(a); got != first {
-			t.Fatalf("同账号第 %d 次派生出不同 UA：\n  %q\n  %q", i+1, first, got)
+	ua := webUAFor(c, cn)
+
+	// 四段必须齐全：Mozilla 头、WorkBuddy 版本、Chrome 内核、Electron 运行时。
+	for _, want := range []string{
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+		"AppleWebKit/537.36",
+		"WorkBuddy/" + defaultClientVersionCN,
+		"Chrome/" + webDomainChromeVersion,
+		"Electron/" + webDomainElectronVersion,
+		"Safari/537.36",
+	} {
+		if !strings.Contains(ua, want) {
+			t.Errorf("UA 缺片段 %q，实际 %q", want, ua)
 		}
 	}
 }
 
-// 多个账号必须落到不同浏览器/版本上，不能全池同一套。
-func TestDeriveWebUASpreadAcrossAccounts(t *testing.T) {
-	seen := map[string]struct{}{}
-	browsers := map[string]struct{}{}
-	for i := 0; i < 40; i++ {
-		uid := "spread-" + string(rune('a'+i%26)) + string(rune('0'+i/26))
-		ua := deriveWebUA(&auth.Auth{UID: uid})
-		seen[ua] = struct{}{}
-		browsers[browserFamily(ua)] = struct{}{}
-	}
-	// 40 个账号应产出多种 UA（至少 8 种不同取值）。
-	if len(seen) < 8 {
-		t.Errorf("40 个账号只派生出 %d 种 UA，区分度不足", len(seen))
-	}
-	// 且覆盖面不止 Chrome 一家（说明池生效）。
-	if len(browsers) < 3 {
-		t.Errorf("只覆盖 %d 种浏览器族 %v，池未生效", len(browsers), keys(browsers))
-	}
-}
-
-// UA 必须是合法形态：以 Mozilla/5.0 开头、包含 Windows NT 10.0、含 Chromium 内核版本。
-func TestDeriveWebUAWellFormed(t *testing.T) {
-	for i := 0; i < 30; i++ {
-		uid := "fmt-" + string(rune('0'+i%10))
-		ua := deriveWebUA(&auth.Auth{UID: uid})
-
-		if !strings.HasPrefix(ua, "Mozilla/5.0 (Windows NT 10.0; Win64; x64)") {
-			t.Errorf("UA 前缀不合规：%q", ua)
-		}
-		if !strings.Contains(ua, "AppleWebKit/537.36") {
-			t.Errorf("UA 缺 AppleWebKit 段：%q", ua)
-		}
-		if !strings.Contains(ua, "Chrome/") {
-			t.Errorf("UA 缺 Chrome 内核段：%q", ua)
-		}
-		// 不能留下未替换的格式占位（%s/%d），那是拼装失败的直接证据。
-		if strings.Contains(ua, "%s") || strings.Contains(ua, "%d") {
-			t.Errorf("UA 含未替换占位符：%q", ua)
-		}
-	}
-}
-
-// Edge 的 Edg/ 段必须与 Chrome 主版本同号，不能造出不存在的组合。
-func TestDeriveWebUAEdgeVersionConsistent(t *testing.T) {
-	for i := 0; i < 200; i++ {
-		uid := "edge-" + string(rune('a'+i%26)) + string(rune('0'+i/26))
-		ua := deriveWebUA(&auth.Auth{UID: uid})
-		if !strings.Contains(ua, "Edg/") {
+// 全池恒定：不同 uid 必须得到**同一个** UA（官方一台机器多账号共用客户端）。
+func TestWebUAConstantAcrossAccounts(t *testing.T) {
+	c := New()
+	var first string
+	for i, uid := range []string{"acct-a", "acct-b", "acct-c", "acct-d", "acct-e"} {
+		a := &auth.Auth{UID: uid, Domain: "copilot.tencent.com"}
+		a.BackfillRealm()
+		got := webUAFor(c, a)
+		if i == 0 {
+			first = got
 			continue
 		}
-		chrome := majorVersionAfter(ua, "Chrome/")
-		edge := majorVersionAfter(ua, "Edg/")
-		if chrome == "" || edge == "" {
-			t.Fatalf("无法解析版本：%q", ua)
-		}
-		if chrome != edge {
-			t.Errorf("Edge UA 的 Edg 主版本(%s) 与 Chrome 主版本(%s) 不一致：%q", edge, chrome, ua)
+		if got != first {
+			t.Fatalf("uid=%s 的 UA 与其他账号不同：\n  %q\n  %q（官方全池恒定）", uid, first, got)
 		}
 	}
 }
 
-// nil / 空 uid 必须返回可用的兜底 UA，不能 panic 也不能返回空串。
-func TestDeriveWebUANilSafe(t *testing.T) {
-	for _, a := range []*auth.Auth{nil, {UID: ""}} {
-		ua := deriveWebUA(a)
-		if ua == "" {
-			t.Fatal("兜底 UA 为空")
+// 版本段按 realm 走：CN 5.9.3 / global 5.9.4，其余字节一致。
+func TestWebUAVersionFollowsRealm(t *testing.T) {
+	c := New()
+	cn := &auth.Auth{UID: "u1", Domain: "copilot.tencent.com"}
+	cn.BackfillRealm()
+	gl := &auth.Auth{UID: "u2", Domain: "www.workbuddy.ai"}
+	gl.BackfillRealm()
+
+	cnUA, glUA := webUAFor(c, cn), webUAFor(c, gl)
+	if !strings.Contains(cnUA, "WorkBuddy/"+defaultClientVersionCN) {
+		t.Errorf("CN UA 版本段不对：%q", cnUA)
+	}
+	if !strings.Contains(glUA, "WorkBuddy/"+defaultClientVersionGlobal) {
+		t.Errorf("global UA 版本段不对：%q", glUA)
+	}
+	// Chrome / Electron 段两域一致（同一个 Electron 运行时）。
+	if !strings.Contains(glUA, "Chrome/"+webDomainChromeVersion) ||
+		!strings.Contains(glUA, "Electron/"+webDomainElectronVersion) {
+		t.Errorf("global UA 的 Chrome/Electron 段不对：%q", glUA)
+	}
+}
+
+// nil 账号 / 空 client 也要给出可用 UA，不能 panic。
+func TestWebUANilSafe(t *testing.T) {
+	if ua := webUAFor(nil, nil); !strings.HasPrefix(ua, "Mozilla/5.0") {
+		t.Errorf("nil 兜底 UA 形态不合规：%q", ua)
+	}
+	if ua := webUAFor(New(), nil); !strings.Contains(ua, "Electron/") {
+		t.Errorf("nil 账号 UA 缺 Electron 段：%q", ua)
+	}
+}
+
+// 浏览器提示头必须齐全：缺这族头的 Electron 应用不存在（Chromium 自己会加），
+// 少了它们「Mozilla ... Electron/37」这个 UA 反而成了孤证。
+func TestInjectWebClientHints(t *testing.T) {
+	req := httptest.NewRequest("POST", "https://www.workbuddy.cn/v2/report", nil)
+	injectWebClientHints(req, "cross-site", "cors")
+
+	want := map[string]string{
+		"sec-ch-ua":          `"Not)A;Brand";v="8", "Chromium";v="138",?0`,
+		"sec-ch-ua-mobile":   "?0",
+		"sec-ch-ua-platform": `"Windows"`,
+		"Sec-Fetch-Site":     "cross-site",
+		"Sec-Fetch-Mode":     "cors",
+		"Sec-Fetch-Dest":     "empty",
+		"Accept-Language":    "zh-CN",
+		"Accept-Encoding":    "gzip, deflate, br, zstd",
+		"Priority":           "u=1, i",
+	}
+	for k, v := range want {
+		if got := req.Header.Get(k); got != v {
+			t.Errorf("%s = %q want %q", k, got, v)
 		}
-		if !strings.HasPrefix(ua, "Mozilla/5.0") {
-			t.Errorf("兜底 UA 形态不合规：%q", ua)
+	}
+	_ = http.NoBody
+}
+
+// ReportWebEvent 的出站必须带上 Electron UA 与提示头（端到端，打到本地 sink）。
+func TestReportWebEventSendsElectronIdentity(t *testing.T) {
+	var gotUA, gotCH, gotSite, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUA = r.Header.Get("User-Agent")
+		gotCH = r.Header.Get("sec-ch-ua")
+		gotSite = r.Header.Get("Sec-Fetch-Site")
+		b := make([]byte, r.ContentLength)
+		_, _ = r.Body.Read(b)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"msg":"OK"}`))
+	}))
+	defer srv.Close()
+
+	c := New()
+	c.WebBaseCN = srv.URL
+	a := &auth.Auth{UID: "02b6f3fb-0000-0000-0000-000000000000", AccessToken: "at", Nickname: "n"}
+	if err := c.ReportWebEvent(a, "web_element_click", "https://www.workbuddy.cn/space/d/x",
+		"library_doc_intro_click", "WorkBuddy资料库介绍"); err != nil {
+		t.Fatalf("ReportWebEvent: %v", err)
+	}
+
+	if !strings.Contains(gotUA, "Electron/") || !strings.Contains(gotUA, "WorkBuddy/") {
+		t.Errorf("出站 UA 不是官方 Electron 形态：%q", gotUA)
+	}
+	if gotCH == "" {
+		t.Error("未发送 sec-ch-ua（Electron 客户端必有）")
+	}
+	if gotSite != "cross-site" {
+		t.Errorf("Sec-Fetch-Site = %q want cross-site（XHR 形态）", gotSite)
+	}
+	// 事件体里的 userAgent 必须与头一致，否则是两套指纹。
+	if strings.Contains(gotBody, "userAgent") {
+		uaIdx := strings.Index(gotBody, `"userAgent":"`)
+		if uaIdx >= 0 {
+			rest := gotBody[uaIdx+len(`"userAgent":"`):]
+			end := strings.Index(rest, `"`)
+			if end > 0 && rest[:end] != gotUA {
+				t.Errorf("事件体 userAgent(%q) 与请求头 UA(%q) 不一致", rest[:end], gotUA)
+			}
 		}
 	}
-}
-
-// ---------------------------------------------------------------------------
-
-// browserFamily 从 UA 提取浏览器族名（用于统计覆盖面）。
-func browserFamily(ua string) string {
-	switch {
-	case strings.Contains(ua, "MicroMessenger"):
-		return "wechat"
-	case strings.Contains(ua, "Edg/"):
-		return "edge"
-	case strings.Contains(ua, "QQBrowser"):
-		return "qq"
-	case strings.Contains(ua, "360SE"):
-		return "360se"
-	case strings.Contains(ua, "360EE"):
-		return "360ee"
-	case strings.Contains(ua, "MetaSr"):
-		return "sogou"
-	case strings.Contains(ua, "UBrowser"):
-		return "uc"
-	default:
-		return "chrome"
-	}
-}
-
-// majorVersionAfter 取 marker 之后的第一个版本主号（如 "Chrome/152.0" → "152"）。
-func majorVersionAfter(s, marker string) string {
-	i := strings.Index(s, marker)
-	if i < 0 {
-		return ""
-	}
-	rest := s[i+len(marker):]
-	j := 0
-	for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
-		j++
-	}
-	return rest[:j]
-}
-
-func keys(m map[string]struct{}) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	return out
 }
